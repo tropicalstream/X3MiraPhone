@@ -7,10 +7,16 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.view.Display
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -75,10 +81,17 @@ class CaptureService : Service() {
     private var reqFps = 30
     private var reqBitrate = 4_000_000
     @Volatile private var clientSock: Socket? = null
+    @Volatile private var clientOut: DataOutputStream? = null
+    private val writeLock = Any()
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    @Volatile private var audioOn = false
     private val pipelineLock = Any()
     @Volatile private var rebuilding = false
     @Volatile private var portraitBias = true   // which way the panel started
     private var displayListener: DisplayManager.DisplayListener? = null
+    private var nsd: NsdManager? = null
+    private var nsdReg: NsdManager.RegistrationListener? = null
     @Volatile private var running = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -153,6 +166,7 @@ class CaptureService : Service() {
         val capH = if (real.y > 0) ((real.y / 2) / 16) * 16 else h
         Log.i(TAG, "capturing at phone-native ${capW}x$capH")
         buildPipeline(capW, capH)
+        startAudioCapture(mp)
 
         // One client at a time, but ROBUST to churn: accept always keeps
         // running, and a NEW connection evicts the OLD one. Without this a
@@ -165,6 +179,7 @@ class CaptureService : Service() {
         ss.reuseAddress = true
         server = ss
         Log.i(TAG, "listening on $PORT")
+        advertise()
         while (running) {
             val sock = try { ss.accept() } catch (e: Throwable) { break }
             Log.i(TAG, "client ${sock.inetAddress.hostAddress}")
@@ -173,6 +188,7 @@ class CaptureService : Service() {
             thread(name = "dexprobe-client", isDaemon = true) {
                 runCatching { pump(sock, w, h, fps) }
                     .onFailure { Log.w(TAG, "client ended: ${it.message}") }
+                clientOut = null
                 runCatching { sock.close() }
             }
         }
@@ -243,23 +259,30 @@ class CaptureService : Service() {
                 .onFailure { Log.w(TAG, "input channel ended: ${it.message}") }
         }
         val out = DataOutputStream(sock.getOutputStream().buffered(1 shl 16))
-        out.writeInt(MAGIC_HELLO); out.writeInt(w); out.writeInt(h); out.writeInt(fps)
-        // Tell the glasses whether clicks will do anything, so the wearer
-        // can be shown "mirroring only" instead of tapping into the void.
-        out.writeInt(if (InjectBridge.ready) 1 else 0)
-        out.flush()
+        synchronized(writeLock) {
+            out.writeInt(MAGIC_HELLO); out.writeInt(w); out.writeInt(h); out.writeInt(fps)
+            // Whether clicks do anything, and whether audio follows, so the
+            // glasses can show the true state and size their AudioTrack.
+            out.writeInt(if (InjectBridge.ready) 1 else 0)
+            out.writeInt(if (audioOn) AUDIO_RATE else 0)
+            out.writeInt(2)   // stereo
+            out.flush()
+        }
+        clientOut = out
 
         // Replay the parameter sets before anything else, then ask for a
         // fresh keyframe so the picture starts from a complete image rather
         // than from whatever half-updated frame the stream is mid-way
         // through.
         codecConfig?.let { cfg ->
-            out.writeInt(MAGIC_FRAME)
-            out.writeLong(SystemClock.elapsedRealtimeNanos())
-            out.writeInt(MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-            out.writeInt(cfg.size)
-            out.write(cfg)
-            out.flush()
+            synchronized(writeLock) {
+                out.writeInt(MAGIC_FRAME)
+                out.writeLong(SystemClock.elapsedRealtimeNanos())
+                out.writeInt(MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+                out.writeInt(cfg.size)
+                out.write(cfg)
+                out.flush()
+            }
             Log.i(TAG, "replayed codec config to new client")
         }
         runCatching {
@@ -306,12 +329,14 @@ class CaptureService : Service() {
                 if (encodeUs > worstEncodeUs) worstEncodeUs = encodeUs
             }
 
-            out.writeInt(MAGIC_FRAME)
-            out.writeLong(nowNanos)
-            out.writeInt(info.flags)
-            out.writeInt(payload.size)
-            out.write(payload)
-            out.flush()
+            synchronized(writeLock) {
+                out.writeInt(MAGIC_FRAME)
+                out.writeLong(nowNanos)
+                out.writeInt(info.flags)
+                out.writeInt(payload.size)
+                out.write(payload)
+                out.flush()
+            }
 
             runCatching { codec.releaseOutputBuffer(idx, false) }
             frames++
@@ -472,8 +497,113 @@ class CaptureService : Service() {
         dm.registerDisplayListener(listener, null)
     }
 
+    /**
+     * Capture the phone's PLAYBACK audio and stream it beside the video.
+     *
+     * AudioPlaybackCapture (API 29+) taps what the phone is PLAYING —
+     * media, games, browser video — not the microphone, which is why it
+     * pairs with the same MediaProjection grant. Apps can opt out and
+     * system/DRM audio is never capturable, but ordinary media plays
+     * through. Raw 48 kHz stereo PCM is ~1.5 Mbps: a rounding error next to
+     * the link and cheaper in code than an AAC round trip, and audio wants
+     * the low latency raw gives.
+     *
+     * It runs continuously and independently of clients; frames are written
+     * only when a client is attached, and under [writeLock] so an audio
+     * chunk never splits a video frame on the wire.
+     */
+    private fun startAudioCapture(mp: MediaProjection) {
+        val cfg = runCatching {
+            AudioPlaybackCaptureConfiguration.Builder(mp)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+        }.getOrElse { Log.w(TAG, "audio config failed: ${it.message}"); return }
+
+        val fmt = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(AUDIO_RATE)
+            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+            .build()
+        val minBuf = AudioRecord.getMinBufferSize(
+            AUDIO_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(4096)
+
+        val rec = runCatching {
+            AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(cfg)
+                .setAudioFormat(fmt)
+                .setBufferSizeInBytes(minBuf * 2)
+                .build()
+        }.getOrElse {
+            // Almost always a missing RECORD_AUDIO grant. Mirror still works;
+            // say so rather than crash.
+            Log.w(TAG, "audio record failed (RECORD_AUDIO?): ${it.message}")
+            return
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.w(TAG, "audio record not initialized")
+            return
+        }
+        audioRecord = rec
+        audioOn = true
+        rec.startRecording()
+        Log.i(TAG, "audio capture started ${AUDIO_RATE}Hz stereo")
+
+        audioThread = kotlin.concurrent.thread(name = "dexprobe-audio") {
+            val buf = ByteArray(minBuf)
+            while (running && audioOn) {
+                val n = rec.read(buf, 0, buf.size)
+                if (n <= 0) continue
+                val o = clientOut ?: continue
+                runCatching {
+                    synchronized(writeLock) {
+                        o.writeInt(MAGIC_AUDIO)
+                        o.writeInt(n)
+                        o.write(buf, 0, n)
+                        o.flush()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Advertise over mDNS so the glasses find this phone by NAME, never by
+     * IP. A phone's DHCP address changes — a new lease, a different network —
+     * and a hardcoded IP in the glasses breaks the moment it does (the
+     * "wrong .11" failure). A service registered as "$SERVICE_NAME" of type
+     * "$SERVICE_TYPE" is resolvable wherever the phone lands, so reconnect
+     * just works after an address change.
+     */
+    private fun advertise() {
+        val mgr = getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return
+        val info = NsdServiceInfo().apply {
+            serviceName = SERVICE_NAME
+            serviceType = SERVICE_TYPE
+            port = PORT
+        }
+        val reg = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(s: NsdServiceInfo) {
+                Log.i(TAG, "mDNS registered as ${s.serviceName}")
+            }
+            override fun onRegistrationFailed(s: NsdServiceInfo, err: Int) {
+                Log.w(TAG, "mDNS registration failed: $err")
+            }
+            override fun onServiceUnregistered(s: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(s: NsdServiceInfo, err: Int) {}
+        }
+        runCatching { mgr.registerService(info, NsdManager.PROTOCOL_DNS_SD, reg) }
+            .onSuccess { nsd = mgr; nsdReg = reg }
+            .onFailure { Log.w(TAG, "mDNS register threw: ${it.message}") }
+    }
+
     private fun shutdown() {
+        runCatching { nsdReg?.let { nsd?.unregisterService(it) } }
         running = false
+        audioOn = false
+        runCatching { audioRecord?.stop(); audioRecord?.release() }; audioRecord = null
         runCatching {
             displayListener?.let {
                 (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
@@ -511,6 +641,10 @@ class CaptureService : Service() {
         const val CHAN = "dexprobe"
         const val MAGIC_HELLO = 0xDEC0DE00.toInt()
         const val MAGIC_FRAME = 0xDEC0DE01.toInt()
+        const val MAGIC_AUDIO = 0xDEC0DE02.toInt()
+        const val AUDIO_RATE = 48_000
+        const val SERVICE_TYPE = "_dexprobe._tcp."
+        const val SERVICE_NAME = "DexProbe"
         const val EXTRA_RESULT_CODE = "code"
         const val EXTRA_RESULT_DATA = "data"
         const val EXTRA_WIDTH = "w"
