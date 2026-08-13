@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Gesture dispatch ONLY. No event types, no window-content retrieval:
+    this service must be able to touch the screen and must not be able to
+    read it, and the wearer should be able to see that from the manifest.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canPerformGestures="true"
+    android:notificationTimeout="100"
+    android:description="@string/dex_input_desc" />

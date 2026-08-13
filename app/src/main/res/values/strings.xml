@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">DexProbe</string>
+    <string name="dex_input_desc">Lets the glasses trackpad tap, drag and scroll this phone. It dispatches gestures only — it does not read screen content.</string>
+</resources>
