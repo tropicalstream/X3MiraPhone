@@ -393,11 +393,33 @@ class CaptureService : Service() {
                     // seconds; blocking here would stall every tap and scroll
                     // the wearer made in the meantime, and the glasses would
                     // look frozen while the agent was thinking.
-                    if (kind == RPC_HTTP) {
-                        rpcPool.execute { runHttp(id, url, method, headers, body) }
-                    } else {
-                        Log.w(TAG, "unknown rpc kind $kind")
-                        sendReply(id, 0, "unknown rpc kind".toByteArray())
+                    when (kind) {
+                        RPC_HTTP -> rpcPool.execute { runHttp(id, url, method, headers, body) }
+                        // TYPE, answered rather than fired blindly. The
+                        // envelope is reused: `url` carries the text and
+                        // `method` carries "1"/"0" for submit. The glasses
+                        // used to send this and never learn the outcome — so
+                        // an agent whose text went nowhere believed it had
+                        // typed, saw an unchanged screen, sent the same words
+                        // again, and hit its own repeat guard. The reply is
+                        // what lets it recover instead.
+                        RPC_TYPE -> rpcPool.execute {
+                            if (!HudCfg.agentTyping(this)) {
+                                sendReply(id, 0, "typing is off in settings".toByteArray())
+                            } else {
+                                val ok = InjectBridge.type(url, method == "1")
+                                sendReply(
+                                    id,
+                                    if (ok) 1 else 0,
+                                    (if (ok) "typed" else "no text field is focused")
+                                        .toByteArray()
+                                )
+                            }
+                        }
+                        else -> {
+                            Log.w(TAG, "unknown rpc kind $kind")
+                            sendReply(id, 0, "unknown rpc kind".toByteArray())
+                        }
                     }
                 }
                 'X' -> {
@@ -1218,6 +1240,7 @@ class CaptureService : Service() {
         const val MAGIC_REPLY = 0xDEC0DE05.toInt()
         /** RPC kinds carried by the 'Q' verb. */
         const val RPC_HTTP = 1
+        const val RPC_TYPE = 2
         /** True while the capture pipeline is up; read by MainActivity so a
          *  second icon-tap opens settings instead of re-requesting capture. */
         @Volatile var live = false
