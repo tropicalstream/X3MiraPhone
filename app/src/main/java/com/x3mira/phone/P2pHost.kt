@@ -95,10 +95,33 @@ object P2pHost {
                 INSTANCE, SERVICE, mapOf("port" to port.toString())
             )
             m.addLocalService(c, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.i(TAG, "service advertised") }
+                override fun onSuccess() {
+                    Log.i(TAG, "service advertised")
+                    // Advertising is not enough on its own. A group owner that
+                    // has only registered a local service does not reliably
+                    // ANSWER service queries — the framework has to be in a
+                    // discovery state to respond, which is why the glasses
+                    // could sweep all day and find nothing while this end
+                    // believed it was announcing itself.
+                    keepDiscoverable(m, c)
+                }
                 override fun onFailure(reason: Int) { Log.w(TAG, "advertise failed: $reason") }
             })
         }
+    }
+
+    private val beat = android.os.Handler(Looper.getMainLooper())
+
+    /** Discovery expires; re-arm it so the phone stays answerable. */
+    private fun keepDiscoverable(m: WifiP2pManager, c: WifiP2pManager.Channel) {
+        if (!active) return
+        runCatching {
+            m.discoverPeers(c, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { Log.i(TAG, "discoverable") }
+                override fun onFailure(reason: Int) { Log.w(TAG, "discoverPeers: $reason") }
+            })
+        }
+        beat.postDelayed({ keepDiscoverable(m, c) }, 15_000L)
     }
 
     fun stop() {

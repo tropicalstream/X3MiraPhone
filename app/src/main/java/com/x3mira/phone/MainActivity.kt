@@ -251,6 +251,8 @@ class MainActivity : Activity() {
         fontRow.text = "HUD text size:   " + when (HudCfg.fontPct(this)) {
             80 -> "Small"; 120 -> "Large"; else -> "Medium"
         }
+        p2pRow.text = "Connection:   " + if (HudCfg.p2pHost(this))
+            "Wi-Fi Direct — no router needed" else "Wi-Fi network"
         pointerRow.text = "Mouse pointer speed:   ${HudCfg.pointerPct(this)}%" +
             if (HudCfg.pointerPct(this) == 80) "  (default)" else ""
         // Say what Auto is doing RIGHT NOW, not just that it is on. "Auto" alone
