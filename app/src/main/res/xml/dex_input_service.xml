@@ -1,12 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Gesture dispatch ONLY. No event types, no window-content retrieval:
-    this service must be able to touch the screen and must not be able to
-    read it, and the wearer should be able to see that from the manifest.
+    Gestures, plus ONE narrow use of window content: putting text into the
+    field the wearer is already focused on.
+
+    This declaration used to say gesture-dispatch-only, and that the service
+    "must be able to touch the screen and must not be able to read it". That
+    promise was written when this was a plain mirror. It stopped being the
+    honest description once the page agent existed: the agent sends a full
+    picture of the screen to a vision model on every step of an errand, so
+    refusing the service the ability to read a text field was withholding
+    something far narrower than what the app already does in the open.
+
+    What it buys is the one thing gestures cannot do at all. Typing by tapping
+    keys is not a workaround — that is a model round trip per letter, and the
+    agent's own repeat-guard blocks the second "s" in "best".
+
+    canRetrieveWindowContent is used in exactly one place: InjectBridge.type.
+    It looks for somewhere to put text — the focused node, else the nearest
+    editable field beneath it, else the one in the window — and writes there.
+    The search exists because input focus frequently lands on a WRAPPER rather
+    than the field itself, and a wrapper refuses ACTION_SET_TEXT however
+    editable its contents are; Spotify's search bar does exactly that.
+
+    That search does visit nodes other than the focused one, so it is fair to
+    call it a bounded walk rather than a single lookup. It reads only what it
+    needs to answer "can this take text?" — never the text a node contains —
+    it stops at 400 nodes or 12 levels, it runs ONLY during a type action, and
+    it is gated behind a setting that is OFF by default.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeViewFocused"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
     android:notificationTimeout="100"
     android:description="@string/dex_input_desc" />
