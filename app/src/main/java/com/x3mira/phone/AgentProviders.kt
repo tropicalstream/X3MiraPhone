@@ -174,4 +174,73 @@ object AgentProviders {
             }
         }.start()
     }
+
+    /**
+     * The same call, BLOCKING and byte-clean, for requests relayed from the
+     * glasses.
+     *
+     * [rawRequest] takes a String body and hands back through a callback,
+     * which suits a page's fetch and suits this badly: the relayed bodies are
+     * JPEG frames and audio, and a round trip through String would corrupt
+     * them. The caller is already on a worker thread and wants an answer to
+     * put back on the wire, so blocking is the honest shape here.
+     *
+     * The credential is attached at THIS end. The glasses send the request
+     * without one, so the key never crosses the link — which also means a
+     * pair of glasses is not carrying a usable secret around.
+     */
+    fun rawBytes(
+        context: Context,
+        url: String,
+        method: String,
+        headersJson: String,
+        body: ByteArray
+    ): Pair<Int, ByteArray> = try {
+        val builder = Request.Builder().url(url)
+        var contentType = "application/json"
+        runCatching {
+            val h = JSONObject(headersJson)
+            for (k in h.keys()) {
+                val v = h.optString(k)
+                if (k.equals("authorization", true)) continue
+                if (k.equals("x-goog-api-key", true)) continue
+                if (k.equals("content-type", true)) contentType = v
+                builder.header(k, v)
+            }
+        }
+        // WHICH key, and in WHICH header, are both decided from the URL — the
+        // glasses send no credential at all, so this end has to work it out.
+        //
+        // Host picks the key: a vision call to Google must not be signed with
+        // the Groq key just because Groq happens to be the selected provider.
+        //
+        // Path picks the header, and getting this wrong fails in a way that
+        // reads like a bad key. Google's NATIVE API wants x-goog-api-key;
+        // its OpenAI-compatible layer (note the /openai in that base URL)
+        // wants a bearer. The glasses' page agent talks to the native one.
+        val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull().orEmpty()
+        val provider = ALL.firstOrNull { p ->
+            runCatching { java.net.URI(p.baseUrl).host?.lowercase() }.getOrNull() == host
+        }
+        val k = if (provider != null) key(context, provider) else key(context)
+        if (k.isNotBlank()) {
+            val google = host.endsWith("generativelanguage.googleapis.com")
+            if (google && !url.contains("/openai", ignoreCase = true)) {
+                builder.header("x-goog-api-key", k)
+            } else {
+                builder.header("Authorization", "Bearer $k")
+            }
+        }
+        if (method.equals("GET", true) || method.equals("HEAD", true)) {
+            builder.method(method.uppercase(), null)
+        } else {
+            builder.method(method.uppercase(), body.toRequestBody(contentType.toMediaType()))
+        }
+        http.newCall(builder.build()).execute().use { resp ->
+            Pair(resp.code, resp.body?.bytes() ?: ByteArray(0))
+        }
+    } catch (t: Throwable) {
+        Log.w(TAG, "rawBytes failed: ${t.message}")
+        Pair(0, (t.message ?: "network error").toByteArray())
+    }
 }

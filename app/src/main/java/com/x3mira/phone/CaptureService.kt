@@ -103,6 +103,15 @@ class CaptureService : Service() {
      * and a runtime prompt. What matters here is only "is sound already
      * leaving over Bluetooth", and that is exactly what the output list says.
      */
+    /**
+     * Model calls the glasses handed over. Several can be in flight — an
+     * errand transcribes while the previous hop's vision call is still
+     * returning — and each occupies a thread for seconds.
+     */
+    private val rpcPool = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+        Thread(r, "x3mira-rpc").apply { isDaemon = true }
+    }
+
     @Volatile private var btAudioOut = false
     private var audioDevices: AudioDeviceCallback? = null
     @Volatile private var audioOn = false
@@ -347,6 +356,30 @@ class CaptureService : Service() {
                 }
                 'U' -> openWebPage(inp.readUTF())
                 'A' -> openApp(inp.readUTF())
+                'Q' -> {
+                    // Read the WHOLE request on this thread before handing it
+                    // off: the reader owns the stream, and anything that
+                    // returns before draining the body desyncs every message
+                    // after it.
+                    val id = inp.readInt()
+                    val kind = inp.readInt()
+                    val url = inp.readUTF()
+                    val method = inp.readUTF()
+                    val headers = inp.readUTF()
+                    val blen = inp.readInt()
+                    val body = ByteArray(blen)
+                    inp.readFully(body)
+                    // ...and perform it OFF this thread. A model call takes
+                    // seconds; blocking here would stall every tap and scroll
+                    // the wearer made in the meantime, and the glasses would
+                    // look frozen while the agent was thinking.
+                    if (kind == RPC_HTTP) {
+                        rpcPool.execute { runHttp(id, url, method, headers, body) }
+                    } else {
+                        Log.w(TAG, "unknown rpc kind $kind")
+                        sendReply(id, 0, "unknown rpc kind".toByteArray())
+                    }
+                }
                 'X' -> {
                     // Read BOTH fields before deciding anything: bailing early
                     // on a disabled setting would leave the unread bytes in
@@ -391,6 +424,51 @@ class CaptureService : Service() {
      * "Google Photos Editor"; a contains-match is the fallback for the times
      * someone says "maps" and means "Google Maps".
      */
+    /**
+     * Perform one request the glasses asked for, and post the answer back.
+     *
+     * The allowlist is the point of doing it here rather than trusting the
+     * caller. The glasses hand over a URL that ultimately came from a model
+     * reading a web page, and this end holds the API keys and a cellular
+     * connection — so a request is performed only if it is HTTPS and goes to
+     * a host this app already talks to. A proxy that forwarded anything asked
+     * of it would be an open relay wearing the phone's identity.
+     */
+    private fun runHttp(
+        id: Int, url: String, method: String, headersJson: String, body: ByteArray
+    ) {
+        val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull()
+        val https = url.startsWith("https://", ignoreCase = true)
+        val allowed = https && host != null &&
+            AgentProviders.HOSTS.any { host == it || host.endsWith(".$it") }
+        if (!allowed) {
+            Log.w(TAG, "rpc REFUSED host=$host")
+            sendReply(id, 0, "host not allowed".toByteArray())
+            return
+        }
+        val started = SystemClock.uptimeMillis()
+        val r = AgentProviders.rawBytes(this, url, method, headersJson, body)
+        Log.i(
+            TAG,
+            "rpc $id -> ${r.first} ${r.second.size}b in ${SystemClock.uptimeMillis() - started}ms  $host"
+        )
+        sendReply(id, r.first, r.second)
+    }
+
+    private fun sendReply(id: Int, status: Int, body: ByteArray) {
+        val out = clientOut ?: return
+        synchronized(writeLock) {
+            runCatching {
+                out.writeInt(MAGIC_REPLY)
+                out.writeInt(id)
+                out.writeInt(status)
+                out.writeInt(body.size)
+                out.write(body)
+                out.flush()
+            }.onFailure { Log.w(TAG, "reply $id failed: ${it.message}") }
+        }
+    }
+
     private fun openApp(name: String) {
         val want = name.trim()
         if (want.isEmpty()) return
@@ -1044,6 +1122,9 @@ class CaptureService : Service() {
         const val MAGIC_AUDIO = 0xDEC0DE02.toInt()
         const val MAGIC_NOTIF = 0xDEC0DE03.toInt()
         const val MAGIC_HUDCFG = 0xDEC0DE04.toInt()
+        const val MAGIC_REPLY = 0xDEC0DE05.toInt()
+        /** RPC kinds carried by the 'Q' verb. */
+        const val RPC_HTTP = 1
         /** True while the capture pipeline is up; read by MainActivity so a
          *  second icon-tap opens settings instead of re-requesting capture. */
         @Volatile var live = false
