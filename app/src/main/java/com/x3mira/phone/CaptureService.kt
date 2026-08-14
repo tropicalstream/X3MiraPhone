@@ -759,14 +759,23 @@ class CaptureService : Service() {
             }
             else -> curBitrate
         }
+        if (frac > 0.20f) {
+            // Saturation is worth a line even when the rate is already at the
+            // floor — a silent adaptation loop cannot be told from a dead one.
+            Log.i(TAG, "link saturated: blocked ${(frac * 100).toInt()}% at ${curBitrate / 1000}kbps")
+        }
         if (next != curBitrate) {
             curBitrate = next
             runCatching {
                 enc.setParameters(android.os.Bundle().apply {
                     putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
                 })
-                Log.i(TAG, "bitrate -> ${next / 1000}kbps (blocked ${(frac * 100).toInt()}%)")
+            }.onFailure {
+                // The vendor encoder may refuse runtime changes; swallowing
+                // that here cost a diagnosis round. Say it once per attempt.
+                Log.w(TAG, "setParameters(bitrate) refused: ${it.message}")
             }
+            Log.i(TAG, "bitrate -> ${next / 1000}kbps (blocked ${(frac * 100).toInt()}%)")
         }
     }
 

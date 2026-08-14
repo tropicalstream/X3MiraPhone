@@ -51,7 +51,10 @@ object P2pHost {
     const val NET_NAME = "DIRECT-x3mira"
     const val PASSPHRASE = "x3mira-link-2026"
     /** Patience before conceding the learned channel is not working. */
-    const val JOIN_FALLBACK_MS = 90_000L
+    // Five minutes, not ninety seconds: the join includes a HUMAN tapping an
+    // invitation dialog, and the first fallback raced the wearer to it — the
+    // group was rebuilt on another channel while the accept was mid-air.
+    const val JOIN_FALLBACK_MS = 300_000L
 
     private var manager: WifiP2pManager? = null
     private var channel: WifiP2pManager.Channel? = null
