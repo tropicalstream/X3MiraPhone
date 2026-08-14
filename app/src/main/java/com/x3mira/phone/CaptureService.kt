@@ -360,6 +360,22 @@ class CaptureService : Service() {
                 }
                 'U' -> openWebPage(inp.readUTF())
                 'A' -> openApp(inp.readUTF())
+                'F' -> {
+                    // The glasses reporting which channel their OTHER Wi-Fi
+                    // life is on. A single-radio client associated to a router
+                    // on one channel and a P2P group on another time-slices
+                    // between the two, and sustained video collapses — 2 fps
+                    // measured against 40+ on a shared channel. Remembered
+                    // here so the NEXT group forms where the glasses already
+                    // are; 0 means "not associated" and changes nothing.
+                    val hz = inp.readInt()
+                    if (hz > 2000) {
+                        Log.i(TAG, "glasses report STA on ${hz}MHz — next group will match")
+                        HudCfg.setP2pFreq(this, hz)
+                    } else {
+                        Log.i(TAG, "glasses report no STA association")
+                    }
+                }
                 'Q' -> {
                     // Read the WHOLE request on this thread before handing it
                     // off: the reader owns the stream, and anything that
@@ -664,6 +680,7 @@ class CaptureService : Service() {
                 if (encodeUs > worstEncodeUs) worstEncodeUs = encodeUs
             }
 
+            val wStart = SystemClock.elapsedRealtime()
             synchronized(writeLock) {
                 out.writeInt(MAGIC_FRAME)
                 out.writeLong(nowNanos)
@@ -672,6 +689,15 @@ class CaptureService : Service() {
                 out.write(payload)
                 out.flush()
             }
+            // Time spent inside that block is the LINK talking back. A write
+            // to a TCP socket only stalls when the send buffer is full, and
+            // the buffer is only full when the network cannot drain the
+            // stream — which is exactly the condition where pushing the same
+            // bitrate turns into seconds of queued, stale video on the
+            // glasses. Observed hard on a Wi-Fi Direct group sharing one
+            // radio with a router association: 4 Mbps in, ~1 Mbps out, 2 fps
+            // and multi-second latency.
+            blockedMs += SystemClock.elapsedRealtime() - wStart
 
             runCatching { codec.releaseOutputBuffer(idx, false) }
             frames++
@@ -679,6 +705,7 @@ class CaptureService : Service() {
 
             val now = SystemClock.elapsedRealtime()
             if (now - lastReport >= 2000) {
+                adaptBitrate(now - lastReport)
                 val secs = (now - started) / 1000.0
                 Log.i(
                     TAG,
@@ -694,6 +721,55 @@ class CaptureService : Service() {
         }
     }
 
+    // ── Adaptive bitrate ─────────────────────────────────────────────
+    // Written by the pump thread only.
+    private var blockedMs = 0L
+    private var curBitrate = 0
+    private var healthyWindows = 0
+
+    /**
+     * Step the encoder's bitrate to what the link is actually draining.
+     *
+     * DOWN fast, UP slowly. When writes were blocked for more than a fifth
+     * of the window the link is saturated and video is already stale on the
+     * far end, so the cut is aggressive (x0.6, floor 500kbps) — a softer
+     * picture that MOVES beats a sharp one from four seconds ago. Recovery
+     * needs three consecutive clean windows and climbs gently, because a
+     * link that just drowned tends to drown again, and oscillating quality
+     * is more distracting than a steady modest one.
+     *
+     * PARAMETER_KEY_VIDEO_BITRATE applies live: no encoder rebuild, no
+     * keyframe stall, nothing for the glasses to renegotiate.
+     */
+    private fun adaptBitrate(windowMs: Long) {
+        val enc = encoder ?: return
+        if (curBitrate == 0) curBitrate = reqBitrate
+        val frac = blockedMs.toFloat() / windowMs.coerceAtLeast(1)
+        blockedMs = 0
+        val next = when {
+            frac > 0.20f -> {
+                healthyWindows = 0
+                (curBitrate * 0.6f).toInt().coerceAtLeast(500_000)
+            }
+            frac < 0.05f && curBitrate < reqBitrate -> {
+                if (++healthyWindows >= 3) {
+                    healthyWindows = 0
+                    (curBitrate * 1.3f).toInt().coerceAtMost(reqBitrate)
+                } else curBitrate
+            }
+            else -> curBitrate
+        }
+        if (next != curBitrate) {
+            curBitrate = next
+            runCatching {
+                enc.setParameters(android.os.Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
+                })
+                Log.i(TAG, "bitrate -> ${next / 1000}kbps (blocked ${(frac * 100).toInt()}%)")
+            }
+        }
+    }
+
     /**
      * Build the encoder and the mirror surface at (w, h). Called once at
      * start and again on every rotation, because a MediaCodec input surface
@@ -703,6 +779,9 @@ class CaptureService : Service() {
      */
     private fun buildPipeline(w: Int, h: Int): Unit = synchronized(pipelineLock) {
         val mp = projRef ?: return
+        // A fresh encoder starts at the requested bitrate; the adaptation
+        // state must agree with it or the first window lies.
+        curBitrate = reqBitrate; blockedMs = 0; healthyWindows = 0
         val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)

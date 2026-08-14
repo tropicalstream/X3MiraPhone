@@ -92,6 +92,16 @@ object HudCfg {
     fun p2pHost(ctx: Context) = prefs(ctx).getBoolean("p2p_host", false)
     fun setP2pHost(ctx: Context, v: Boolean) = prefs(ctx).edit().putBoolean("p2p_host", v).apply()
 
+    /**
+     * The channel the glasses' infrastructure Wi-Fi was last seen on, learned
+     * over the wire. The next P2P group forms HERE, so a single-radio client
+     * serves its router and the mirror on one channel instead of time-slicing
+     * two — which measured as the difference between 2 fps and 40. Zero means
+     * never learned; the group then defaults to 2.4 GHz.
+     */
+    fun p2pFreq(ctx: Context) = prefs(ctx).getInt("p2p_freq", 0)
+    fun setP2pFreq(ctx: Context, v: Int) = prefs(ctx).edit().putInt("p2p_freq", v).apply()
+
     /** Set by CaptureService so a settings change reaches the glasses live. */
     @Volatile
     var onChange: (() -> Unit)? = null

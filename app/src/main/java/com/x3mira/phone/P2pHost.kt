@@ -50,15 +50,19 @@ object P2pHost {
      */
     const val NET_NAME = "DIRECT-x3mira"
     const val PASSPHRASE = "x3mira-link-2026"
+    /** Patience before conceding the learned channel is not working. */
+    const val JOIN_FALLBACK_MS = 90_000L
 
     private var manager: WifiP2pManager? = null
     private var channel: WifiP2pManager.Channel? = null
+    private var hostCtx: Context? = null
 
     @Volatile var active = false
         private set
 
     fun start(ctx: Context, port: Int) {
         if (active) return
+        hostCtx = ctx.applicationContext
         val m = ctx.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager ?: run {
             Log.w(TAG, "no Wi-Fi P2P service on this device")
             return
@@ -78,29 +82,62 @@ object P2pHost {
     }
 
     private fun create(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int) {
+        // Prefer the CHANNEL THE GLASSES ALREADY LIVE ON, learned over the
+        // wire last session. A single-radio client associated to a router on
+        // one channel and a group on another time-slices between the two and
+        // sustained video collapses — measured at 2 fps against 40+ once the
+        // channels agree. When nothing was ever learned, 2.4 GHz: the band
+        // every peer supports and the one that found the glasses at all
+        // (the framework's own choice, 5 GHz ch149, was invisible to them).
+        val learned = hostCtx?.let { HudCfg.p2pFreq(it) } ?: 0
+        createOn(m, c, port, learned.takeIf { it > 2000 })
+    }
+
+    private fun createOn(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int, freq: Int?) {
         runCatching {
-            // 2.4 GHz, PINNED. Left to choose, the framework put this group
-            // on 5 GHz channel 149 — and a device already associated to a home
-            // network on another channel cannot reliably scan or join it,
-            // which is exactly what the glasses were failing to do. 2.4 is the
-            // band every peer supports and the one that penetrates a room.
-            val cfg = android.net.wifi.p2p.WifiP2pConfig.Builder()
+            val b = android.net.wifi.p2p.WifiP2pConfig.Builder()
                 .setNetworkName(NET_NAME)
                 .setPassphrase(PASSPHRASE)
-                .setGroupOperatingBand(android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
-                .build()
-            m.createGroup(c, cfg, object : WifiP2pManager.ActionListener {
+            if (freq != null) b.setGroupOperatingFrequency(freq)
+            else b.setGroupOperatingBand(android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+            m.createGroup(c, b.build(), object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     active = true
-                    Log.i(TAG, "group created — phone is owner at 192.168.49.1:$port")
+                    Log.i(TAG, "group created on ${freq ?: "2.4GHz"} — owner at 192.168.49.1:$port")
                     advertise(m, c, port)
+                    // A learned channel the GLASSES cannot actually join —
+                    // wrong hardware, regulatory band, stale memory — would
+                    // strand the pair silently. If nobody arrives, fall back
+                    // to the band that is known to work.
+                    if (freq != null) armJoinFallback(m, c, port)
                 }
-
                 override fun onFailure(reason: Int) {
-                    Log.w(TAG, "createGroup failed: $reason")
+                    Log.w(TAG, "createGroup(${freq ?: "2.4"}) failed: $reason")
+                    if (freq != null) {
+                        Log.i(TAG, "retrying on 2.4 GHz")
+                        createOn(m, c, port, null)
+                    }
                 }
             })
         }.onFailure { Log.w(TAG, "createGroup threw: ${it.message}") }
+    }
+
+    /** If no client joins the learned-channel group, rebuild it on 2.4. */
+    private fun armJoinFallback(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int) {
+        beat.postDelayed({
+            if (!active) return@postDelayed
+            runCatching {
+                m.requestGroupInfo(c) { g ->
+                    if (g != null && g.clientList.isEmpty()) {
+                        Log.w(TAG, "no client joined the learned channel — rebuilding on 2.4 GHz")
+                        m.removeGroup(c, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { createOn(m, c, port, null) }
+                            override fun onFailure(reason: Int) { createOn(m, c, port, null) }
+                        })
+                    }
+                }
+            }
+        }, JOIN_FALLBACK_MS)
     }
 
     /**
