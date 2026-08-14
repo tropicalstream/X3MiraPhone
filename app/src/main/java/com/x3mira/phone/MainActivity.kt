@@ -40,9 +40,10 @@ class MainActivity : Activity() {
     private lateinit var notifRow: TextView
     private lateinit var readoutRow: TextView
     private lateinit var fontRow: TextView
+    private lateinit var pointerRow: TextView
     private lateinit var audioRow: TextView
     private lateinit var agentRow: TextView
-    private lateinit var a11yRow: TextView
+    private lateinit var typingRow: TextView
     private lateinit var keyRow: TextView
     private val ui = Handler(Looper.getMainLooper())
     private val statusTick = object : Runnable {
@@ -119,6 +120,13 @@ class MainActivity : Activity() {
             HudCfg.setFontPct(this, next)
             refreshRows(); HudCfg.onChange?.invoke()
         }
+        pointerRow = row(col) {
+            val next = when (HudCfg.pointerPct(this)) {
+                50 -> 65; 65 -> 80; 80 -> 100; 100 -> 130; else -> 50
+            }
+            HudCfg.setPointerPct(this, next)
+            refreshRows(); HudCfg.onChange?.invoke()
+        }
         audioRow = row(col) {
             HudCfg.setAudioMode(this, (HudCfg.audioMode(this) + 1) % 3)  // Auto → Always → Never
             refreshRows()
@@ -143,8 +151,8 @@ class MainActivity : Activity() {
             HudCfg.setAgentOn(this, !HudCfg.agentOn(this))
             refreshRows(); HudCfg.onChange?.invoke()
         }
-        a11yRow = row(col) {
-            HudCfg.setA11yContext(this, !HudCfg.a11yContext(this))
+        typingRow = row(col) {
+            HudCfg.setAgentTyping(this, !HudCfg.agentTyping(this))
             refreshRows(); HudCfg.onChange?.invoke()
         }
         keyRow = row(col) { refreshRows() }   // status only; tap re-checks
@@ -219,6 +227,8 @@ class MainActivity : Activity() {
         fontRow.text = "HUD text size:   " + when (HudCfg.fontPct(this)) {
             80 -> "Small"; 120 -> "Large"; else -> "Medium"
         }
+        pointerRow.text = "Mouse pointer speed:   ${HudCfg.pointerPct(this)}%" +
+            if (HudCfg.pointerPct(this) == 80) "  (default)" else ""
         // Say what Auto is doing RIGHT NOW, not just that it is on. "Auto" alone
         // leaves the wearer guessing which way it went, which is how a silent
         // mirror gets reported as broken audio.
@@ -229,8 +239,8 @@ class MainActivity : Activity() {
         }
         agentRow.text = "Page agent:   " +
             if (HudCfg.agentOn(this)) "On — tap to ask or instruct" else "Off"
-        a11yRow.text = "Read screen text:   " +
-            if (HudCfg.a11yContext(this)) "On (accessibility)" else "Off — agent sees the picture"
+        typingRow.text = "Let the agent type:   " +
+            if (HudCfg.agentTyping(this)) "On" else "Off — it can press, not type"
         // Status, not a secret: the wearer needs to know a key is THERE, and
         // the provider that would answer, never the key itself.
         val provider = AgentProviders.provider(this)
@@ -252,15 +262,22 @@ class MainActivity : Activity() {
 
     /** The one paragraph explaining what the agent does and what it sends. */
     private fun TextView.avatarNote(): TextView = apply {
-        text = "Tap the glasses pad and speak: ask about whatever is on this screen, " +
-            "or tell it what to do — press something, scroll to find something, open " +
-            "a site or an app. Double-tap to stop. Swipe up or down on the pad to " +
-            "scroll the phone yourself, and press and hold to click. The assistant's " +
-            "face sits in the HUD band beside the clock — never over the picture.\n\n" +
-            "With \"Read screen text\" OFF the agent sends one still image of this " +
-            "screen per step it takes. Turning it ON would also let it read the screen's " +
-            "text through the accessibility service, which is otherwise only allowed " +
-            "to touch the screen, never to read it."
+        text = "RIGHT arm: tap and speak — ask about whatever is on this screen, or " +
+            "tell it what to do: press something, scroll to find something, open a " +
+            "site or an app. Swipe to pan the phone any direction. Double-tap to " +
+            "summon the mouse pointer, then swipe to move it and tap to click; it " +
+            "pulls the page along at the edges and fades after a few seconds.\n\n" +
+            "LEFT arm: tap to cancel — it dismisses the pointer and stops the agent. " +
+            "Its swipe is left alone, because that is the glasses' own volume " +
+            "control. The assistant's face sits in the HUD band beside the clock — " +
+            "never over the picture.\n\n" +
+            "The agent sends one still image of this screen per step it takes, only " +
+            "after you tap.\n\n" +
+            "\"Let the agent type\" is off by default. Gestures cannot type — tapping a " +
+            "word out key by key costs a round trip per letter — so turning it on lets " +
+            "the input service put text straight into the field you are focused on. " +
+            "That is the only thing in the app that touches window content, and it is " +
+            "used for nothing else: no reading the screen, no watching what you type."
         setTextColor(0x99FFFFFF.toInt())
         textSize = 12.5f
         setPadding(dp(2), dp(10), dp(2), dp(24))

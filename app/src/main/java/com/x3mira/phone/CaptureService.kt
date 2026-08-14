@@ -313,6 +313,8 @@ class CaptureService : Service() {
      *   'S' x1 y1 x2 y2 ms drag / scroll
      *   'G' action         global: 1=back 2=home 3=recents
      *   'U' url            open a web address (UTF)
+     *   'A' name           launch an installed app by label (UTF)
+     *   'X' text submit    type into the focused field (UTF + int)
      */
     private fun readInput(sock: Socket, w: Int, h: Int) {
         val inp = DataInputStream(sock.getInputStream())
@@ -344,6 +346,16 @@ class CaptureService : Service() {
                     }
                 }
                 'U' -> openWebPage(inp.readUTF())
+                'A' -> openApp(inp.readUTF())
+                'X' -> {
+                    // Read BOTH fields before deciding anything: bailing early
+                    // on a disabled setting would leave the unread bytes in
+                    // the stream and desync every message after it.
+                    val text = inp.readUTF()
+                    val submit = inp.readInt() == 1
+                    if (HudCfg.agentTyping(this)) InjectBridge.type(text, submit)
+                    else Log.w(TAG, "typing is off — ignoring ${text.length} chars")
+                }
                 else -> return   // desynchronised — drop the client
             }
         }
@@ -364,6 +376,50 @@ class CaptureService : Service() {
      * "tel:" targets, and a page that displays such a string should not be
      * able to talk the agent into firing one. Web schemes only.
      */
+    /**
+     * Launch an installed app by the name a person would call it.
+     *
+     * "Open Spotify" is not a URL, and it was quietly unreachable: the agent
+     * could open web addresses and press things it could see, so an app that
+     * was not already on screen simply could not be got to. Sending it to
+     * spotify.com instead would land in the web player, which is not what
+     * anybody means.
+     *
+     * Matched on the LAUNCHER LABEL rather than a package name, because the
+     * wearer says "Spotify", not "com.spotify.music", and the model has no way
+     * to know the latter. Exact match first so "Photos" cannot be won by
+     * "Google Photos Editor"; a contains-match is the fallback for the times
+     * someone says "maps" and means "Google Maps".
+     */
+    private fun openApp(name: String) {
+        val want = name.trim()
+        if (want.isEmpty()) return
+        val pm = packageManager
+        val launchables = runCatching {
+            pm.queryIntentActivities(
+                Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+            )
+        }.getOrDefault(emptyList())
+        val hit = launchables.firstOrNull {
+            it.loadLabel(pm).toString().equals(want, ignoreCase = true)
+        } ?: launchables.firstOrNull {
+            it.loadLabel(pm).toString().contains(want, ignoreCase = true)
+        }
+        if (hit == null) {
+            Log.w(TAG, "no installed app matching '$want' (${launchables.size} searched)")
+            return
+        }
+        val pkg = hit.activityInfo.packageName
+        Log.i(TAG, "agent opening app '${hit.loadLabel(pm)}' ($pkg)")
+        runCatching {
+            val launch = pm.getLaunchIntentForPackage(pkg)
+                ?: Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).apply {
+                    setClassName(pkg, hit.activityInfo.name)
+                }
+            startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }.onFailure { Log.w(TAG, "app launch failed: ${it.message}") }
+    }
+
     private fun openWebPage(raw: String) {
         val url = raw.trim().let { if (it.contains("://")) it else "https://$it" }
         val scheme = runCatching { android.net.Uri.parse(url).scheme }.getOrNull()?.lowercase()
@@ -373,10 +429,24 @@ class CaptureService : Service() {
         }
         Log.i(TAG, "agent opening $url")
         runCatching {
-            startActivity(
-                Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            // Ask the browser to treat this as ITS OWN navigation rather than a
+            // handoff from another app. Samsung Internet interrupts every
+            // app-opened page with a "X3Mira opened this page" panel that sits
+            // over the article — which is reasonable once and maddening on an
+            // errand that opens several pages, and there is no setting to
+            // silence it (the one it offers only makes app-opening stricter).
+            //
+            // EXTRA_APPLICATION_ID is the documented hint for "which app owns
+            // this tab", and naming the browser itself is the long-standing way
+            // to ask for a plain navigation. It is a HINT, not a contract: a
+            // browser is free to show its banner anyway.
+            val browser = packageManager.resolveActivity(intent, 0)?.activityInfo?.packageName
+            if (browser != null) {
+                intent.putExtra(android.provider.Browser.EXTRA_APPLICATION_ID, browser)
+            }
+            startActivity(intent)
         }.onFailure { Log.w(TAG, "open failed: ${it.message}") }
     }
 
@@ -394,9 +464,12 @@ class CaptureService : Service() {
                 out.writeInt(HudCfg.readoutMode(this))
                 out.writeInt(HudCfg.fontPct(this))
                 // Agent flags ride the same message so the glasses never have
-                // a half-applied config. Reader must consume all five.
+                // a half-applied config. Reader must consume all SIX — adding
+                // a field here without the matching read desyncs the stream,
+                // so the two apps ship together.
                 out.writeInt(if (HudCfg.agentOn(this)) 1 else 0)
-                out.writeInt(if (HudCfg.a11yContext(this)) 1 else 0)
+                out.writeInt(if (HudCfg.agentTyping(this)) 1 else 0)
+                out.writeInt(HudCfg.pointerPct(this))
                 out.flush()
             }
         }

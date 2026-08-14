@@ -8,6 +8,23 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        See the apps that have a launcher icon, so "open Spotify" can find
+        Spotify. From Android 11 a package is invisible unless it is declared
+        here, and queryIntentActivities would simply return an empty list.
+
+        Scoped to MAIN/LAUNCHER rather than asking for QUERY_ALL_PACKAGES:
+        that permission is the "see every package installed" one Play treats
+        as sensitive, and this only needs the apps a person could tap on their
+        own home screen anyway.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:label="X3Mira"
         android:usesCleartextTraffic="true"

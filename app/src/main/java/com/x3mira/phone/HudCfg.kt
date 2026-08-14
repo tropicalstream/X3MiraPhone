@@ -28,19 +28,24 @@ object HudCfg {
     fun setAgentOn(ctx: Context, v: Boolean) = prefs(ctx).edit().putBoolean("agent_on", v).apply()
 
     /**
-     * OPT-IN, DEFAULT OFF. Lets the agent read the phone's screen TEXT through
-     * the accessibility service instead of only seeing the mirrored picture.
+     * OPT-IN, DEFAULT OFF. Lets the agent put text into a focused field.
      *
-     * It is off by default and must stay a deliberate choice, because
-     * res/xml/dex_input_service.xml is written as a service that "must be able
-     * to touch the screen and must not be able to read it" — turning this on
-     * reverses that, and the wearer is the only one who gets to do so. With it
-     * off the agent still works: it looks at the same picture the wearer is
-     * looking at.
+     * This replaces a "Read screen text" toggle that promised the agent could
+     * read the screen through the accessibility service. That row was inert in
+     * both directions — nothing consumed the flag, and the service declaration
+     * forbade the retrieval it described — so it offered the wearer a choice
+     * that did nothing whichever way they set it.
+     *
+     * What it gates now is real and much narrower: typing. The service is
+     * allowed to reach the focused input node and set its text, which is the
+     * one thing gestures cannot do — tapping out a word key by key costs a
+     * model round trip per letter, and the agent's own repeat-guard blocks the
+     * second "s" in "best". It stays off by default because it is the only
+     * thing in the app that touches window content at all.
      */
-    fun a11yContext(ctx: Context) = prefs(ctx).getBoolean("agent_a11y", false)
-    fun setA11yContext(ctx: Context, v: Boolean) =
-        prefs(ctx).edit().putBoolean("agent_a11y", v).apply()
+    fun agentTyping(ctx: Context) = prefs(ctx).getBoolean("agent_typing", false)
+    fun setAgentTyping(ctx: Context, v: Boolean) =
+        prefs(ctx).edit().putBoolean("agent_typing", v).apply()
 
     /**
      * Whether to stream the phone's sound to the glasses.
@@ -60,6 +65,21 @@ object HudCfg {
      */
     fun audioMode(ctx: Context) = prefs(ctx).getInt("audio_mode", 0)
     fun setAudioMode(ctx: Context, v: Int) = prefs(ctx).edit().putInt("audio_mode", v).apply()
+
+    /**
+     * Mouse-pointer speed on the glasses, as a percentage.
+     *
+     * 100% is how the old aim point travelled, so this reads as a change from
+     * a known feel. The default is 80: at full rate the pointer overshoots
+     * small targets, because the temple pad is a couple of centimetres wide
+     * and is being asked to cover a whole phone screen.
+     *
+     * Set here rather than on the glasses because judging a pointer's speed
+     * means watching it move while you change the number, and the glasses'
+     * own settings panel is driven by the very pad being tuned.
+     */
+    fun pointerPct(ctx: Context) = prefs(ctx).getInt("pointer_pct", 80)
+    fun setPointerPct(ctx: Context, v: Int) = prefs(ctx).edit().putInt("pointer_pct", v).apply()
 
     /** Set by CaptureService so a settings change reaches the glasses live. */
     @Volatile
