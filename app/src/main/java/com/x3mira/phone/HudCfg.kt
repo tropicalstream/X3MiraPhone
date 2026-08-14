@@ -42,6 +42,25 @@ object HudCfg {
     fun setA11yContext(ctx: Context, v: Boolean) =
         prefs(ctx).edit().putBoolean("agent_a11y", v).apply()
 
+    /**
+     * Whether to stream the phone's sound to the glasses.
+     *
+     * 0 = AUTO (default), 1 = always, 2 = never.
+     *
+     * AUTO exists because of a genuine collision: the glasses can also be
+     * paired to the phone over Bluetooth, and A2DP already carries the sound
+     * to the same speakers. Both paths at once is the same audio twice, a
+     * couple of hundred milliseconds apart — which is heard as a slight echo
+     * or reverb rather than as an obvious duplicate, so it is easy to blame on
+     * the codec and hard to find. AUTO simply does not send a second copy
+     * while Bluetooth is carrying the first.
+     *
+     * The setting is phone-side only and needs no wire change: the glasses
+     * play whatever arrives, and silence is a valid thing to arrive.
+     */
+    fun audioMode(ctx: Context) = prefs(ctx).getInt("audio_mode", 0)
+    fun setAudioMode(ctx: Context, v: Int) = prefs(ctx).edit().putInt("audio_mode", v).apply()
+
     /** Set by CaptureService so a settings change reaches the glasses live. */
     @Volatile
     var onChange: (() -> Unit)? = null

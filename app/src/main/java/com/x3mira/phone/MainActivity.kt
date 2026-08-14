@@ -1,6 +1,7 @@
 package com.x3mira.phone
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -39,6 +40,7 @@ class MainActivity : Activity() {
     private lateinit var notifRow: TextView
     private lateinit var readoutRow: TextView
     private lateinit var fontRow: TextView
+    private lateinit var audioRow: TextView
     private lateinit var agentRow: TextView
     private lateinit var a11yRow: TextView
     private lateinit var keyRow: TextView
@@ -117,6 +119,18 @@ class MainActivity : Activity() {
             HudCfg.setFontPct(this, next)
             refreshRows(); HudCfg.onChange?.invoke()
         }
+        audioRow = row(col) {
+            HudCfg.setAudioMode(this, (HudCfg.audioMode(this) + 1) % 3)  // Auto → Always → Never
+            refreshRows()
+        }
+        col.addView(TextView(this).apply {
+            text = "Sound: on Auto the phone stops streaming audio while Bluetooth is already " +
+                "carrying it to the glasses. Both at once is the same sound twice, a fraction " +
+                "of a second apart — it is heard as an echo."
+            setTextColor(0x99FFFFFF.toInt())
+            textSize = 12.5f
+            setPadding(dp(2), dp(10), dp(2), 0)
+        })
         col.addView(TextView(this).apply {
             text = "The HUD keeps to bands above and below the mirror — it never covers the phone picture, in portrait or landscape. Changes apply on the glasses instantly."
             setTextColor(0x99FFFFFF.toInt())
@@ -205,6 +219,14 @@ class MainActivity : Activity() {
         fontRow.text = "HUD text size:   " + when (HudCfg.fontPct(this)) {
             80 -> "Small"; 120 -> "Large"; else -> "Medium"
         }
+        // Say what Auto is doing RIGHT NOW, not just that it is on. "Auto" alone
+        // leaves the wearer guessing which way it went, which is how a silent
+        // mirror gets reported as broken audio.
+        audioRow.text = "Sound to glasses:   " + when (HudCfg.audioMode(this)) {
+            1 -> "Always stream"
+            2 -> "Never stream"
+            else -> if (btAudioOut()) "Auto — Bluetooth is carrying it" else "Auto — streaming"
+        }
         agentRow.text = "Page agent:   " +
             if (HudCfg.agentOn(this)) "On — tap to ask or instruct" else "Off"
         a11yRow.text = "Read screen text:   " +
@@ -216,6 +238,17 @@ class MainActivity : Activity() {
         keyRow.text = "API key:   " +
             if (hasKey) "set  ·  ${provider.label}" else "none — push a key file or broadcast it"
     }
+
+    /** Is the phone's sound already leaving over Bluetooth? Needs no permission. */
+    private fun btAudioOut(): Boolean = runCatching {
+        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        }
+    }.getOrDefault(false)
 
     /** The one paragraph explaining what the agent does and what it sends. */
     private fun TextView.avatarNote(): TextView = apply {

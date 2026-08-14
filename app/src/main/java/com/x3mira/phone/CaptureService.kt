@@ -14,7 +14,10 @@ import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.MediaFormat
@@ -89,6 +92,19 @@ class CaptureService : Service() {
     private val writeLock = Any()
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
+
+    /**
+     * True while the phone has a Bluetooth output attached — which, when it is
+     * the glasses, is already carrying the sound to the wearer's ears.
+     *
+     * Read from AudioManager's device list rather than from the Bluetooth
+     * adapter on purpose: the output list needs no permission at all, while
+     * asking BluetoothAdapter about connected profiles wants BLUETOOTH_CONNECT
+     * and a runtime prompt. What matters here is only "is sound already
+     * leaving over Bluetooth", and that is exactly what the output list says.
+     */
+    @Volatile private var btAudioOut = false
+    private var audioDevices: AudioDeviceCallback? = null
     @Volatile private var audioOn = false
     private val pipelineLock = Any()
     @Volatile private var rebuilding = false
@@ -721,6 +737,55 @@ class CaptureService : Service() {
      * only when a client is attached, and under [writeLock] so an audio
      * chunk never splits a video frame on the wire.
      */
+    /**
+     * Should the sound go on the wire right now?
+     *
+     * The wearer can force it either way; AUTO is the default and answers no
+     * while Bluetooth is already carrying the phone's sound, because both at
+     * once arrive at the same ears a couple of hundred milliseconds apart and
+     * are heard as an echo. Bluetooth is the path that gets to win: it also
+     * carries the audio this one is not permitted to capture at all — a live
+     * voice conversation runs as USAGE_VOICE_COMMUNICATION, which
+     * AudioPlaybackCapture is forbidden to touch — so it is strictly the more
+     * complete of the two.
+     */
+    private fun shouldStreamAudio(): Boolean = when (HudCfg.audioMode(this)) {
+        1 -> true
+        2 -> false
+        else -> !btAudioOut
+    }
+
+    /**
+     * Keep [btAudioOut] honest as headphones come and go mid-session. A
+     * one-time check at start would be wrong the moment the wearer connects
+     * the glasses over Bluetooth after the mirror is already running — which
+     * is exactly the order it happens in.
+     */
+    private fun watchBluetoothOutput() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        fun refresh() {
+            val bt = runCatching {
+                am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            }.getOrDefault(false)
+            if (bt != btAudioOut) {
+                btAudioOut = bt
+                Log.i(TAG, "bluetooth audio out=$bt — streaming audio=${shouldStreamAudio()}")
+            }
+        }
+        refresh()
+        val cb = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) = refresh()
+            override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) = refresh()
+        }
+        audioDevices = cb
+        runCatching { am.registerAudioDeviceCallback(cb, Handler(Looper.getMainLooper())) }
+    }
+
     private fun startAudioCapture(mp: MediaProjection) {
         val cfg = runCatching {
             AudioPlaybackCaptureConfiguration.Builder(mp)
@@ -766,11 +831,17 @@ class CaptureService : Service() {
         rec.startRecording()
         Log.i(TAG, "audio capture started ${AUDIO_RATE}Hz stereo")
 
+        watchBluetoothOutput()
+
         audioThread = kotlin.concurrent.thread(name = "dexprobe-audio") {
             val buf = ByteArray(minBuf)
             while (running && audioOn) {
+                // Always DRAIN, even when not sending. Leaving the record
+                // buffer to fill would make the audio that resumes on the far
+                // side be whatever was captured seconds ago.
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) continue
+                if (!shouldStreamAudio()) continue
                 val o = clientOut ?: continue
                 runCatching {
                     synchronized(writeLock) {
@@ -846,6 +917,12 @@ class CaptureService : Service() {
         running = false
         audioOn = false
         runCatching { audioRecord?.stop(); audioRecord?.release() }; audioRecord = null
+        runCatching {
+            audioDevices?.let {
+                (getSystemService(Context.AUDIO_SERVICE) as AudioManager)
+                    .unregisterAudioDeviceCallback(it)
+            }
+        }; audioDevices = null
         runCatching {
             displayListener?.let {
                 (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
