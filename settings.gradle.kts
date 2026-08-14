@@ -4,5 +4,5 @@ pluginManagement {
 dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
-rootProject.name = "dexprobe"
+rootProject.name = "x3miraphone"
 include(":app")

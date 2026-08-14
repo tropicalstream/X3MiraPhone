@@ -6,11 +6,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
-        android:label="DexProbe"
+        android:label="X3Mira"
         android:usesCleartextTraffic="true"
-        android:icon="@android:drawable/ic_menu_view">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -23,7 +25,7 @@
         <service
             android:name=".DexInputService"
             android:exported="true"
-            android:label="DexProbe input"
+            android:label="X3Mira input"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -36,5 +38,27 @@
             android:name=".CaptureService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+        <!--
+            API key delivery over adb, the same two doors x3hub uses: push a
+            key file into the app's external files dir, or send the SET_API_KEY
+            broadcast with a "key" string extra. See ApiKeyStore.
+            exported=false keeps that broadcast door to adb/shell and this app.
+        -->
+        <receiver
+            android:name=".ApiKeyBroadcastReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.x3mira.phone.SET_API_KEY" />
+            </intent-filter>
+        </receiver>
+        <service
+            android:name=".DexNotificationService"
+            android:exported="false"
+            android:label="X3Mira notifications"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.dexprobe.app"
+    namespace = "com.x3mira.phone"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.dexprobe.app"
+        applicationId = "com.x3mira.phone"
         // The phone is the capture side; 29 covers MediaProjection with a
         // foreground service of type mediaProjection.
         minSdk = 29
@@ -30,4 +30,5 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

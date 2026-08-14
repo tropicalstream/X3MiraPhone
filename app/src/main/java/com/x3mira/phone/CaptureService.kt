@@ -1,4 +1,4 @@
-package com.dexprobe.app
+package com.x3mira.phone
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -20,7 +20,9 @@ import android.media.AudioRecord
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -58,9 +60,11 @@ import kotlin.concurrent.thread
 class CaptureService : Service() {
 
     private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var encoder: MediaCodec? = null
-    private var inputSurface: Surface? = null
+    // Swapped on rotation from the rotate thread and read by pump/accept threads:
+    // must be @Volatile so the new encoder/surface are seen promptly.
+    @Volatile private var virtualDisplay: VirtualDisplay? = null
+    @Volatile private var encoder: MediaCodec? = null
+    @Volatile private var inputSurface: Surface? = null
     private var server: ServerSocket? = null
 
     /**
@@ -93,11 +97,33 @@ class CaptureService : Service() {
     private var nsd: NsdManager? = null
     private var nsdReg: NsdManager.RegistrationListener? = null
     @Volatile private var running = false
+    private var screenLock: android.os.PowerManager.WakeLock? = null
+
+    // Rotation follow. The DisplayListener fires on this handler (a real Looper),
+    // debounces rapid flips, then hands the actual reconfigure to a worker thread
+    // so nothing heavy runs on the main thread.
+    private val rotateHandler = Handler(Looper.getMainLooper())
+    @Volatile private var pendingRotate: (() -> Unit)? = null
+    private val runPendingRotate = Runnable {
+        val job = pendingRotate ?: return@Runnable
+        pendingRotate = null
+        thread(name = "dexprobe-rotate") {
+            runCatching { job() }.onFailure { Log.w(TAG, "rotate job failed: ${it.message}") }
+        }
+    }
+    private val clearRebuilding = Runnable { rebuilding = false }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (running) return START_NOT_STICKY
+        if (running) {
+            // A second start while live must still honour the
+            // startForegroundService contract — go (idempotently) foreground
+            // again rather than silently returning, or the OS may kill the
+            // process ~10s later for a start that never foregrounded.
+            startForegroundNotice()
+            return START_NOT_STICKY
+        }
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         val data = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         if (resultCode == 0 || data == null) {
@@ -120,7 +146,16 @@ class CaptureService : Service() {
 
         startForegroundNotice()
         running = true
-        thread(name = "dexprobe-capture") { runCapture(resultCode, data, w, h, fps, bitrate) }
+        live = true
+        acquireScreenLock()
+        // Guarded: an uncaught throw on a raw thread (encoder busy,
+        // BindException on a fast restart) kills the entire process — which
+        // to the user is "the app just crashes". Fail into a clean shutdown
+        // instead, so the settings screen survives and can re-request.
+        thread(name = "dexprobe-capture") {
+            runCatching { runCapture(resultCode, data, w, h, fps, bitrate) }
+                .onFailure { Log.e(TAG, "capture failed: ${it.message}", it); runCatching { shutdown() } }
+        }
         return START_NOT_STICKY
     }
 
@@ -135,13 +170,15 @@ class CaptureService : Service() {
         Log.i(TAG, "probe start ${w}x$h @${fps}fps ${bitrate / 1000}kbps")
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val mp = mpm.getMediaProjection(resultCode, data) ?: run {
-            Log.w(TAG, "projection refused"); return
+            // A refused projection (stale/reused token) must not leave a
+            // zombie service latched live=true with a green status and no
+            // pipeline — tear down properly so the next open re-requests.
+            Log.w(TAG, "projection refused"); shutdown(); return
         }
         projection = mp
         projRef = mp
         reqFps = fps
         reqBitrate = bitrate
-        portraitBias = h >= w
         mp.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 // A rotation rebuild briefly has no display; ignore the stop
@@ -165,8 +202,25 @@ class CaptureService : Service() {
         val capW = if (real.x > 0) ((real.x / 2) / 16) * 16 else w
         val capH = if (real.y > 0) ((real.y / 2) / 16) * 16 else h
         Log.i(TAG, "capturing at phone-native ${capW}x$capH")
+        portraitBias = capH >= capW
         buildPipeline(capW, capH)
         startAudioCapture(mp)
+        // Follow rotation so a landscape app fills a landscape frame instead of
+        // being letterboxed sideways into a portrait one. Guarded by a kill
+        // switch and a capture-once fallback (see reconfigurePipeline).
+        if (ROTATE_FOLLOW) watchRotation()
+        // Push notifications to the glasses the instant they arrive, and HUD
+        // settings the instant the wearer changes them on the phone. Both
+        // hooks fire on main/binder threads (settings row clicks, the
+        // notification listener), and a socket write on the main thread is a
+        // NetworkOnMainThreadException that runCatching would swallow into a
+        // silent no-op — so hop to a worker first.
+        NotifBridge.onChange = { text ->
+            thread(name = "dexprobe-notif", isDaemon = true) { pushNotif(text) }
+        }
+        HudCfg.onChange = {
+            thread(name = "dexprobe-hudcfg", isDaemon = true) { pushHudCfg() }
+        }
 
         // One client at a time, but ROBUST to churn: accept always keeps
         // running, and a NEW connection evicts the OLD one. Without this a
@@ -175,8 +229,12 @@ class CaptureService : Service() {
         // phone screen produces no frames the socket is never written to and
         // never detected as dead, so accept is never called again and the
         // next client hangs at "connecting" forever. That was the bug.
-        val ss = ServerSocket(PORT)
+        // reuseAddress must be set BEFORE bind or it is a no-op — the bound
+        // constructor made it decorative, and a quick stop/start of mirroring
+        // could then hit EADDRINUSE from the previous session's TIME_WAIT.
+        val ss = ServerSocket()
         ss.reuseAddress = true
+        ss.bind(java.net.InetSocketAddress(PORT))
         server = ss
         Log.i(TAG, "listening on $PORT")
         advertise()
@@ -188,7 +246,11 @@ class CaptureService : Service() {
             thread(name = "dexprobe-client", isDaemon = true) {
                 runCatching { pump(sock, w, h, fps) }
                     .onFailure { Log.w(TAG, "client ended: ${it.message}") }
-                clientOut = null
+                // Only clear the shared slot if it is still OURS: the new
+                // client that evicted us has already published its own stream,
+                // and nulling it here would silently kill its audio and
+                // notification/settings pushes for the whole session.
+                synchronized(writeLock) { if (clientSock === sock) { clientOut = null; clientSock = null } }
                 runCatching { sock.close() }
             }
         }
@@ -205,6 +267,25 @@ class CaptureService : Service() {
      *   len    int32   payload bytes
      *   data   [len]   one H.264 access unit (Annex-B)
      */
+    private val injectDisplay by lazy {
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)
+    }
+
+    /**
+     * The physical default-display size in its CURRENT rotation — the space
+     * AccessibilityService.dispatchGesture actually lands taps in. Read per
+     * event so it tracks rotation for free (landscape reports x>y), and never
+     * the half-native capture dims, which would compress every click into the
+     * top-left quadrant.
+     */
+    private fun injectSize(): android.graphics.Point {
+        val p = android.graphics.Point()
+        @Suppress("DEPRECATION") injectDisplay?.getRealSize(p)
+        if (p.x <= 0) p.x = 1
+        if (p.y <= 0) p.y = 1
+        return p
+    }
+
     /**
      * The return channel. The glasses send pointer work in NORMALISED
      * coordinates (0..1 of the captured surface) so neither end has to know
@@ -215,6 +296,7 @@ class CaptureService : Service() {
      *   'L' x y            long press
      *   'S' x1 y1 x2 y2 ms drag / scroll
      *   'G' action         global: 1=back 2=home 3=recents
+     *   'U' url            open a web address (UTF)
      */
     private fun readInput(sock: Socket, w: Int, h: Int) {
         val inp = DataInputStream(sock.getInputStream())
@@ -223,15 +305,20 @@ class CaptureService : Service() {
             if (kind < 0) return
             when (kind.toChar()) {
                 'T', 'L' -> {
-                    val x = inp.readFloat() * w
-                    val y = inp.readFloat() * h
+                    val fx = inp.readFloat(); val fy = inp.readFloat()
+                    // Inject in the PHYSICAL display's pixels — that is the space
+                    // dispatchGesture lands in, not the half-native capture size —
+                    // and read it live so a rotation needs no extra plumbing.
+                    val s = injectSize()
+                    val x = fx * s.x; val y = fy * s.y
                     if (kind.toChar() == 'T') InjectBridge.tap(x, y) else InjectBridge.longPress(x, y)
                 }
                 'S' -> {
-                    val x1 = inp.readFloat() * w; val y1 = inp.readFloat() * h
-                    val x2 = inp.readFloat() * w; val y2 = inp.readFloat() * h
+                    val fx1 = inp.readFloat(); val fy1 = inp.readFloat()
+                    val fx2 = inp.readFloat(); val fy2 = inp.readFloat()
                     val ms = inp.readInt().toLong()
-                    InjectBridge.swipe(x1, y1, x2, y2, ms)
+                    val s = injectSize()
+                    InjectBridge.swipe(fx1 * s.x, fy1 * s.y, fx2 * s.x, fy2 * s.y, ms)
                 }
                 'G' -> {
                     when (inp.readInt()) {
@@ -240,7 +327,79 @@ class CaptureService : Service() {
                         3 -> InjectBridge.global(GLOBAL_ACTION_RECENTS)
                     }
                 }
+                'U' -> openWebPage(inp.readUTF())
                 else -> return   // desynchronised — drop the client
+            }
+        }
+    }
+
+    /**
+     * Open a web address in the phone's default browser.
+     *
+     * The agent can tap and it can scroll, but it has no way to TYPE — that
+     * would need the accessibility service to be able to read the screen,
+     * which it deliberately cannot. So "open youtube.com" used to end with it
+     * tapping the address bar, meeting a keyboard, and having nothing left to
+     * do. Handing the phone a URL to open sidesteps the keyboard entirely and
+     * is more reliable than spelling a word out through gestures anyway.
+     *
+     * The URL arrives from a model that is reading a web page, so treat it as
+     * untrusted: an ACTION_VIEW will happily launch "intent:", "file:" or
+     * "tel:" targets, and a page that displays such a string should not be
+     * able to talk the agent into firing one. Web schemes only.
+     */
+    private fun openWebPage(raw: String) {
+        val url = raw.trim().let { if (it.contains("://")) it else "https://$it" }
+        val scheme = runCatching { android.net.Uri.parse(url).scheme }.getOrNull()?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            Log.w(TAG, "refusing non-web url from agent: $raw")
+            return
+        }
+        Log.i(TAG, "agent opening $url")
+        runCatching {
+            startActivity(
+                Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure { Log.w(TAG, "open failed: ${it.message}") }
+    }
+
+    /**
+     * Send the wearer's HUD choices to the glasses: banner lines, readout
+     * mode, text size. Three ints, framed under [writeLock] like everything
+     * else on the wire.
+     */
+    private fun pushHudCfg() {
+        val out = clientOut ?: return
+        synchronized(writeLock) {
+            runCatching {
+                out.writeInt(MAGIC_HUDCFG)
+                out.writeInt(HudCfg.notifLines(this))
+                out.writeInt(HudCfg.readoutMode(this))
+                out.writeInt(HudCfg.fontPct(this))
+                // Agent flags ride the same message so the glasses never have
+                // a half-applied config. Reader must consume all five.
+                out.writeInt(if (HudCfg.agentOn(this)) 1 else 0)
+                out.writeInt(if (HudCfg.a11yContext(this)) 1 else 0)
+                out.flush()
+            }
+        }
+    }
+
+    /**
+     * Send one notification to the connected glasses as a length-prefixed
+     * UTF-8 string, framed like the others so it never splits a video or audio
+     * chunk on the wire.
+     */
+    private fun pushNotif(text: String) {
+        val out = clientOut ?: return
+        synchronized(writeLock) {
+            runCatching {
+                val bytes = text.toByteArray(Charsets.UTF_8)
+                out.writeInt(MAGIC_NOTIF)
+                out.writeInt(bytes.size)
+                out.write(bytes)
+                out.flush()
             }
         }
     }
@@ -269,6 +428,11 @@ class CaptureService : Service() {
             out.flush()
         }
         clientOut = out
+        // Hand the just-connected glasses the wearer's HUD settings first, so
+        // the layout is right from the first frame, then the newest
+        // notification so the banner is populated immediately.
+        pushHudCfg()
+        NotifBridge.latest.takeIf { it.isNotEmpty() }?.let { pushNotif(it) }
 
         // Replay the parameter sets before anything else, then ask for a
         // fresh keyframe so the picture starts from a complete image rather
@@ -404,49 +568,90 @@ class CaptureService : Service() {
      * ones released. The client is dropped in between so it reconnects and
      * reads the new geometry.
      */
-    private fun rebuildPipeline(w: Int, h: Int): Unit = synchronized(pipelineLock) {
-        val mp = projRef ?: return
-        rebuilding = true
-        try {
-            val oldVd = virtualDisplay
+    /**
+     * Follow rotation WITHOUT ever releasing the VirtualDisplay.
+     *
+     * Releasing/recreating the VD (what the old rebuildPipeline did) makes this
+     * hardware treat the projection as stopped and kills the whole process —
+     * proven repeatedly. So the ONE VirtualDisplay object lives the entire
+     * session and is only MUTATED: a MediaCodec input Surface is fixed-size at
+     * configure(), so a new capture resolution needs a fresh encoder + fresh
+     * input Surface; the existing VD is then resize()'d to the new logical size
+     * and setSurface()'d onto that new encoder. The old encoder is torn down
+     * only after the swap, and the client is dropped so it reconnects and reads
+     * the new geometry through the hello it already understands — no mid-stream
+     * protocol on the glasses.
+     *
+     * FAIL-SAFE: if any step throws, the OLD pipeline is left exactly as it was —
+     * still mirroring, still alive (capture-once for that one rotation). A failed
+     * rotation is a soft letterboxed frame, never a dead session. The VD is never
+     * released here under any path.
+     */
+    private fun reconfigurePipeline(newW: Int, newH: Int) {
+        if (newW <= 0 || newH <= 0) return
+        synchronized(pipelineLock) {
+            val vd = virtualDisplay ?: return            // NEVER released
+
+            // 1. Build the new encoder FIRST. A throw here leaves the old
+            //    pipeline completely untouched and still live.
+            val newEnc: MediaCodec
+            val newSurf: Surface
+            try {
+                val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, newW, newH).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                    setInteger(MediaFormat.KEY_BIT_RATE, reqBitrate)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, reqFps)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                    setInteger(MediaFormat.KEY_LATENCY, 1)
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                }
+                newEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                newEnc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                newSurf = newEnc.createInputSurface()
+                newEnc.start()
+            } catch (t: Throwable) {
+                Log.w(TAG, "rotate: encoder build failed, staying capture-once: ${t.message}")
+                return
+            }
+
+            // 2. Commit point. Latch `rebuilding` so an onStop the OEM may emit
+            //    during the surface swap is ignored; cleared on a DELAY so a
+            //    deferred onStop just after the swap is still swallowed.
+            rebuilding = true
+            try {
+                vd.resize(newW, newH, resources.displayMetrics.densityDpi)  // logical size first
+                vd.setSurface(newSurf)                                      // then re-point; never null
+            } catch (t: Throwable) {
+                Log.w(TAG, "rotate: VD mutate failed, keeping old pipeline: ${t.message}")
+                runCatching { newEnc.stop(); newEnc.release() }
+                runCatching { newSurf.release() }
+                armRebuildingClear()
+                return                                                       // old encoder still attached & alive
+            }
+
+            // 3. Publish new refs (volatile), then retire old.
             val oldEnc = encoder
             val oldSurf = inputSurface
+            encoder = newEnc
+            inputSurface = newSurf
+            codecConfig = null            // fresh SPS/PPS come from the new encoder's first output
 
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, reqBitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, reqFps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_LATENCY, 1)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-            }
-            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val surf = codec.createInputSurface()
-            codec.start()
-            val newVd = mp.createVirtualDisplay(
-                "dexprobe", w, h, resources.displayMetrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surf, null, null
-            )
-
-            // Swap the live refs, then drop the client so pump re-accepts on
-            // the new encoder and the glasses re-handshake the new geometry.
-            encoder = codec
-            inputSurface = surf
-            virtualDisplay = newVd
-            codecConfig = null
+            // 4. Drop the client BEFORE releasing the old encoder, so its pump
+            //    exits on the closed socket rather than racing a release().
             runCatching { clientSock?.close() }
-
-            // Now safe to release the old ones — the projection is already
-            // mirroring into the new display.
-            runCatching { oldVd?.release() }
             runCatching { oldEnc?.stop(); oldEnc?.release() }
             runCatching { oldSurf?.release() }
-            Log.i(TAG, "rebuilt ${w}x$h (new-before-old)")
-        } finally {
-            rebuilding = false
+
+            Log.i(TAG, "reconfigured ${newW}x$newH (VD kept alive, client re-dials)")
         }
+        armRebuildingClear()
+    }
+
+    /** Clear the rebuilding latch after a grace window so a deferred onStop is swallowed. */
+    private fun armRebuildingClear() {
+        rotateHandler.removeCallbacks(clearRebuilding)
+        rotateHandler.postDelayed(clearRebuilding, 1500L)
     }
 
     private fun teardownPipeline(): Unit = synchronized(pipelineLock) {
@@ -466,12 +671,11 @@ class CaptureService : Service() {
      * Rotating the capture surface with the phone means a landscape app
      * fills a landscape surface, which then fills the glasses cleanly.
      *
-     * On a change the pipeline is rebuilt at the swapped size and the client
-     * is dropped, so it reconnects and reads the new geometry through the
-     * handshake it already has — no mid-stream resolution protocol needed,
-     * at the cost of one reconnect blip.
+     * On a change the pipeline is reconfigured at the swapped size (VD kept
+     * alive) and the client is dropped, so it reconnects and reads the new
+     * geometry through the handshake it already has — no mid-stream resolution
+     * protocol needed, at the cost of one reconnect blip.
      */
-    @Suppress("unused")
     private fun watchRotation() {
         val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         val listener = object : DisplayManager.DisplayListener {
@@ -483,18 +687,23 @@ class CaptureService : Service() {
                 @Suppress("DEPRECATION") val real = android.graphics.Point()
                     .also { d.getRealSize(it) }
                 val nowPortrait = real.y >= real.x
-                if (nowPortrait == portraitBias) return   // same orientation
+                if (nowPortrait == portraitBias) return   // brightness/refresh churn, not a flip
                 portraitBias = nowPortrait
                 // Half of the phone's CURRENT real size, aligned to 16 — the
                 // same "best" rule as start, now in the new orientation.
                 val nw = ((real.x / 2) / 16) * 16
                 val nh = ((real.y / 2) / 16) * 16
                 Log.i(TAG, "rotation -> ${if (nowPortrait) "portrait" else "landscape"} ${nw}x$nh")
-                thread(name = "dexprobe-rotate") { rebuildPipeline(nw, nh) }
+                pendingRotate = { reconfigurePipeline(nw, nh) }
+                rotateHandler.removeCallbacks(runPendingRotate)
+                rotateHandler.postDelayed(runPendingRotate, 150L)   // coalesce rapid flips
             }
         }
         displayListener = listener
-        dm.registerDisplayListener(listener, null)
+        // MUST be a real Looper, never null: this runs from the Looper-less
+        // capture thread, and a null handler would throw and unwind runCapture
+        // before the ServerSocket is even created.
+        dm.registerDisplayListener(listener, rotateHandler)
     }
 
     /**
@@ -518,6 +727,12 @@ class CaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                // Assistant/TTS voices (a spoken reply from an assistant app)
+                // play under USAGE_ASSISTANT, not USAGE_MEDIA, so without this
+                // they never reach the glasses. NOTE: a live two-way voice mode
+                // that runs as a call uses USAGE_VOICE_COMMUNICATION, which the
+                // OS forbids capturing at all — that audio cannot be mirrored.
+                .addMatchingUsage(AudioAttributes.USAGE_ASSISTANT)
                 .build()
         }.getOrElse { Log.w(TAG, "audio config failed: ${it.message}"); return }
 
@@ -599,7 +814,34 @@ class CaptureService : Service() {
             .onFailure { Log.w(TAG, "mDNS register threw: ${it.message}") }
     }
 
+    /**
+     * A screen mirror of a sleeping display is a black rectangle. The whole
+     * point of this app is that the wearer looks at the GLASSES and drives the
+     * phone from the temple pad — they never touch the phone, so its display
+     * would time out in seconds and the mirror would go dark. Injected
+     * accessibility gestures do not count as user activity either, so nothing
+     * in normal use keeps the panel lit. This does.
+     *
+     * SCREEN_BRIGHT_WAKE_LOCK is deprecated in favour of a window flag, but a
+     * background capture service has no window to hang FLAG_KEEP_SCREEN_ON on,
+     * and on this Samsung the lock is honoured — verified by frame rate, which
+     * collapses to <1fps the moment the phone dozes and holds at the requested
+     * fps while it is held.
+     */
+    @Suppress("DEPRECATION")
+    private fun acquireScreenLock() {
+        if (screenLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        screenLock = pm.newWakeLock(
+            android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "x3mira:mirror"
+        ).apply { setReferenceCounted(false); acquire() }
+        Log.i(TAG, "screen lock acquired — source display stays awake")
+    }
+
     private fun shutdown() {
+        runCatching { if (screenLock?.isHeld == true) screenLock?.release() }; screenLock = null
         runCatching { nsdReg?.let { nsd?.unregisterService(it) } }
         running = false
         audioOn = false
@@ -610,6 +852,10 @@ class CaptureService : Service() {
                     .unregisterDisplayListener(it)
             }
         }
+        rotateHandler.removeCallbacksAndMessages(null)
+        NotifBridge.onChange = null
+        HudCfg.onChange = null
+        live = false
         teardownPipeline()
         runCatching { server?.close() }
         runCatching { virtualDisplay?.release() }
@@ -636,15 +882,24 @@ class CaptureService : Service() {
     }
 
     companion object {
-        const val TAG = "DexProbe"
+        const val TAG = "X3Mira"
+        // Follow phone rotation by reconfiguring the pipeline in place. If the
+        // isolation test ever shows the projection dying on setSurface/resize on
+        // this hardware, set false to revert to guaranteed-alive capture-once.
+        const val ROTATE_FOLLOW = true
         const val PORT = 7391
         const val CHAN = "dexprobe"
         const val MAGIC_HELLO = 0xDEC0DE00.toInt()
         const val MAGIC_FRAME = 0xDEC0DE01.toInt()
         const val MAGIC_AUDIO = 0xDEC0DE02.toInt()
+        const val MAGIC_NOTIF = 0xDEC0DE03.toInt()
+        const val MAGIC_HUDCFG = 0xDEC0DE04.toInt()
+        /** True while the capture pipeline is up; read by MainActivity so a
+         *  second icon-tap opens settings instead of re-requesting capture. */
+        @Volatile var live = false
         const val AUDIO_RATE = 48_000
-        const val SERVICE_TYPE = "_dexprobe._tcp."
-        const val SERVICE_NAME = "DexProbe"
+        const val SERVICE_TYPE = "_x3mira._tcp."
+        const val SERVICE_NAME = "X3Mira"
         const val EXTRA_RESULT_CODE = "code"
         const val EXTRA_RESULT_DATA = "data"
         const val EXTRA_WIDTH = "w"
