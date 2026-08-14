@@ -262,6 +262,10 @@ class CaptureService : Service() {
         ss.bind(java.net.InetSocketAddress(PORT))
         server = ss
         Log.i(TAG, "listening on $PORT")
+        // Opt-in: only host a group when the wearer has said there is no
+        // router to rely on. Forming one otherwise can take the Wi-Fi radio
+        // away from a connection that is working perfectly well.
+        if (HudCfg.p2pHost(this)) P2pHost.start(this, PORT)
         advertise()
         while (running) {
             val sock = try { ss.accept() } catch (e: Throwable) { break }
@@ -1063,6 +1067,7 @@ class CaptureService : Service() {
     }
 
     private fun shutdown() {
+        runCatching { P2pHost.stop() }
         runCatching { if (screenLock?.isHeld == true) screenLock?.release() }; screenLock = null
         runCatching { nsdReg?.let { nsd?.unregisterService(it) } }
         running = false

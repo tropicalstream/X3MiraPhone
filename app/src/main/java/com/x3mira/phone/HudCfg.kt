@@ -81,6 +81,17 @@ object HudCfg {
     fun pointerPct(ctx: Context) = prefs(ctx).getInt("pointer_pct", 80)
     fun setPointerPct(ctx: Context, v: Int) = prefs(ctx).edit().putInt("pointer_pct", v).apply()
 
+    /**
+     * Host a Wi-Fi Direct group instead of relying on a shared network.
+     *
+     * OFF by default. Forming a P2P group can take the Wi-Fi radio away from
+     * an ordinary connection, so a pair that already works on home Wi-Fi must
+     * not have that changed underneath it — this is for the case where there
+     * is no router, and it is the wearer who knows when that is.
+     */
+    fun p2pHost(ctx: Context) = prefs(ctx).getBoolean("p2p_host", false)
+    fun setP2pHost(ctx: Context, v: Boolean) = prefs(ctx).edit().putBoolean("p2p_host", v).apply()
+
     /** Set by CaptureService so a settings change reaches the glasses live. */
     @Volatile
     var onChange: (() -> Unit)? = null

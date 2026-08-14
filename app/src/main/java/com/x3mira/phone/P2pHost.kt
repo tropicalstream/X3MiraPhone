@@ -1,0 +1,114 @@
+package com.x3mira.phone
+
+import android.content.Context
+import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.os.Looper
+import android.util.Log
+
+/**
+ * A Wi-Fi Direct group with the phone as owner, so the glasses can reach it
+ * with no router and no hotspot.
+ *
+ * WHY NOT THE HOTSPOT. Turning on the mobile hotspot works and is what the app
+ * needed until now, but it makes every byte the glasses send TETHERED traffic —
+ * which carriers commonly meter and throttle on a budget separate from
+ * on-device traffic, over the same tower — and it puts the agent's uploads on
+ * the same Wi-Fi channel the mirror is already filling with 4 Mbps of video.
+ * It is also a trip through Settings that the wearer has to remember.
+ *
+ * Wi-Fi Direct is not tethering. The phone keeps CELLULAR as its default
+ * network, so its own traffic — including the model calls it now performs for
+ * the glasses — leaves over LTE untouched, while this group carries only the
+ * mirror.
+ *
+ * THE PHONE IS DELIBERATELY THE GROUP OWNER. createGroup() makes it one
+ * outright rather than negotiating for the role, because the owner is the one
+ * with a fixed, known address (192.168.49.1) and this end is the one holding a
+ * ServerSocket. Letting the role be negotiated would mean the socket sometimes
+ * needed to live on the other device.
+ *
+ * This is ONLY viable because the agent's requests now go through the phone. A
+ * P2P group has no route to the internet: if the glasses still had to reach
+ * Gemini themselves, this would produce a perfect mirror attached to an agent
+ * that failed every errand — which is worse than not working, because it looks
+ * like the model is broken.
+ */
+object P2pHost {
+
+    private const val TAG = "X3MiraP2p"
+
+    /** Matches the service the glasses look for. */
+    const val INSTANCE = "x3mira"
+    const val SERVICE = "_x3mira._tcp"
+
+    private var manager: WifiP2pManager? = null
+    private var channel: WifiP2pManager.Channel? = null
+
+    @Volatile var active = false
+        private set
+
+    fun start(ctx: Context, port: Int) {
+        if (active) return
+        val m = ctx.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager ?: run {
+            Log.w(TAG, "no Wi-Fi P2P service on this device")
+            return
+        }
+        val c = m.initialize(ctx, Looper.getMainLooper(), null)
+        manager = m; channel = c
+
+        // Clear any group left behind by a previous run before making one.
+        // A stale persistent group is the usual reason createGroup returns
+        // BUSY and the glasses then find nothing to join.
+        runCatching {
+            m.removeGroup(c, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { create(m, c, port) }
+                override fun onFailure(reason: Int) { create(m, c, port) }
+            })
+        }.onFailure { create(m, c, port) }
+    }
+
+    private fun create(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int) {
+        runCatching {
+            m.createGroup(c, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    active = true
+                    Log.i(TAG, "group created — phone is owner at 192.168.49.1:$port")
+                    advertise(m, c, port)
+                }
+
+                override fun onFailure(reason: Int) {
+                    Log.w(TAG, "createGroup failed: $reason")
+                }
+            })
+        }.onFailure { Log.w(TAG, "createGroup threw: ${it.message}") }
+    }
+
+    /**
+     * Announce the service so the glasses connect to THIS phone rather than to
+     * whatever Wi-Fi Direct device happens to be nearest. A printer and a TV
+     * are both perfectly good P2P peers and neither is running the mirror.
+     */
+    private fun advertise(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int) {
+        runCatching {
+            val info = WifiP2pDnsSdServiceInfo.newInstance(
+                INSTANCE, SERVICE, mapOf("port" to port.toString())
+            )
+            m.addLocalService(c, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { Log.i(TAG, "service advertised") }
+                override fun onFailure(reason: Int) { Log.w(TAG, "advertise failed: $reason") }
+            })
+        }
+    }
+
+    fun stop() {
+        val m = manager; val c = channel
+        if (m != null && c != null) {
+            runCatching { m.clearLocalServices(c, null) }
+            runCatching { m.removeGroup(c, null) }
+        }
+        active = false
+        manager = null; channel = null
+        Log.i(TAG, "group torn down")
+    }
+}

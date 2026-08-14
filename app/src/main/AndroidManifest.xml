@@ -9,6 +9,27 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!--
+        Wi-Fi Direct, so the glasses can reach the phone with no router and no
+        hotspot. NEARBY_WIFI_DEVICES is the Android 13+ permission and carries
+        neverForLocation because this genuinely does not want the wearer's
+        position — it wants one device in the same room. ACCESS_FINE_LOCATION
+        is the pre-13 equivalent and is capped at 32 so it is not requested on
+        newer releases, where the nearby-devices permission replaces it.
+
+        Both are runtime permissions, and P2P discovery does not fail loudly
+        without them: it returns an empty peer list, which reads as "the phone
+        is not there".
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+
+    <!--
         See the apps that have a launcher icon, so "open Spotify" can find
         Spotify. From Android 11 a package is invisible unless it is declared
         here, and queryIntentActivities would simply return an empty list.

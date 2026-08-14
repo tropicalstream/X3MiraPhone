@@ -40,6 +40,7 @@ class MainActivity : Activity() {
     private lateinit var notifRow: TextView
     private lateinit var readoutRow: TextView
     private lateinit var fontRow: TextView
+    private lateinit var p2pRow: TextView
     private lateinit var pointerRow: TextView
     private lateinit var audioRow: TextView
     private lateinit var agentRow: TextView
@@ -120,6 +121,14 @@ class MainActivity : Activity() {
             HudCfg.setFontPct(this, next)
             refreshRows(); HudCfg.onChange?.invoke()
         }
+        p2pRow = row(col) {
+            HudCfg.setP2pHost(this, !HudCfg.p2pHost(this))
+            refreshRows()
+            // Takes effect on the next start; say so rather than implying live.
+            android.widget.Toast.makeText(
+                this, "Restart mirroring to apply", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
         pointerRow = row(col) {
             val next = when (HudCfg.pointerPct(this)) {
                 50 -> 65; 65 -> 80; 80 -> 100; 100 -> 130; else -> 50
@@ -169,7 +178,22 @@ class MainActivity : Activity() {
 
         // Auto-start is preserved: if the mirror is not already running, ask
         // for the one consent the OS requires the moment the app opens.
+        askNearbyPermission()
         if (!CaptureService.live) requestCapture()
+    }
+
+    /**
+     * Wi-Fi Direct needs a runtime grant and does not complain without one —
+     * discovery simply returns nothing, which reads as "the glasses are not
+     * there". Asked once, up front, so that failure mode never happens.
+     */
+    private fun askNearbyPermission() {
+        val needed = if (android.os.Build.VERSION.SDK_INT >= 33)
+            android.Manifest.permission.NEARBY_WIFI_DEVICES
+        else android.Manifest.permission.ACCESS_FINE_LOCATION
+        if (checkSelfPermission(needed) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            runCatching { requestPermissions(arrayOf(needed), REQ_NEARBY) }
+        }
     }
 
     private fun requestCapture() {
@@ -314,5 +338,8 @@ class MainActivity : Activity() {
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
     ).toInt()
 
-    companion object { private const val REQ = 7391 }
+    companion object {
+        private const val REQ_NEARBY = 4711
+        private const val REQ = 7391
+    }
 }
