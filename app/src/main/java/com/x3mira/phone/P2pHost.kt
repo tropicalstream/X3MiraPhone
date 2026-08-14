@@ -42,6 +42,15 @@ object P2pHost {
     const val INSTANCE = "x3mira"
     const val SERVICE = "_x3mira._tcp"
 
+    /**
+     * A FIXED name and passphrase, rather than the random pair a plain
+     * createGroup generates. Deterministic credentials mean the glasses can
+     * join without being told anything out of band — and the name must begin
+     * with DIRECT- because the platform requires it.
+     */
+    const val NET_NAME = "DIRECT-x3mira"
+    const val PASSPHRASE = "x3mira-link-2026"
+
     private var manager: WifiP2pManager? = null
     private var channel: WifiP2pManager.Channel? = null
 
@@ -70,7 +79,17 @@ object P2pHost {
 
     private fun create(m: WifiP2pManager, c: WifiP2pManager.Channel, port: Int) {
         runCatching {
-            m.createGroup(c, object : WifiP2pManager.ActionListener {
+            // 2.4 GHz, PINNED. Left to choose, the framework put this group
+            // on 5 GHz channel 149 — and a device already associated to a home
+            // network on another channel cannot reliably scan or join it,
+            // which is exactly what the glasses were failing to do. 2.4 is the
+            // band every peer supports and the one that penetrates a room.
+            val cfg = android.net.wifi.p2p.WifiP2pConfig.Builder()
+                .setNetworkName(NET_NAME)
+                .setPassphrase(PASSPHRASE)
+                .setGroupOperatingBand(android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+                .build()
+            m.createGroup(c, cfg, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     active = true
                     Log.i(TAG, "group created — phone is owner at 192.168.49.1:$port")
