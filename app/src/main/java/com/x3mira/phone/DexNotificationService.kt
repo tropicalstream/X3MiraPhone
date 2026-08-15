@@ -25,6 +25,21 @@ class DexNotificationService : NotificationListenerService() {
         if (sbn.packageName == packageName) return          // never mirror our own chip
         if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) return
         if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+        // The Bluetooth stack's device-battery chatter ("10% remaining for
+        // RayNeo X3 Pro") reposts on every percent change, and each repost
+        // reclaims the banner's single slot from whatever REAL notification
+        // was there — the wearer is told about their own glasses' battery,
+        // which the HUD readout already shows, at the price of their actual
+        // messages. The list is these two packages and nothing more. Honest
+        // cost: the same package also posts BT file-transfer results and
+        // car-kit access prompts, so those lose their HUD echo too — the
+        // phone still shows and sounds all of them, and acting on any of
+        // them needs the phone in hand anyway. App notifications — the
+        // messages the banner exists for — are untouched.
+        if (sbn.packageName in TRANSPORT_NOISE) {
+            Log.i(CaptureService.TAG, "notif dropped (transport noise): ${sbn.packageName}")
+            return
+        }
 
         val extras = n.extras ?: return
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
@@ -46,6 +61,14 @@ class DexNotificationService : NotificationListenerService() {
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) { /* keep last shown */ }
+
+    private companion object {
+        /** The BT stack under its AOSP and its Gabeldorsche package names. */
+        val TRANSPORT_NOISE = setOf(
+            "com.android.bluetooth",
+            "com.google.android.bluetooth",
+        )
+    }
 
     private fun appLabel(pkg: String): String = runCatching {
         val pm = packageManager

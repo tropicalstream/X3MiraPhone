@@ -89,7 +89,9 @@ object HudCfg {
      * not have that changed underneath it — this is for the case where there
      * is no router, and it is the wearer who knows when that is.
      */
-    fun p2pHost(ctx: Context) = prefs(ctx).getBoolean("p2p_host", false)
+    // On by default: P2P is what makes the pair work with no router in
+    // reach, and the group only exists while capture runs anyway.
+    fun p2pHost(ctx: Context) = prefs(ctx).getBoolean("p2p_host", true)
     fun setP2pHost(ctx: Context, v: Boolean) = prefs(ctx).edit().putBoolean("p2p_host", v).apply()
 
     /**

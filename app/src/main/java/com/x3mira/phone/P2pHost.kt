@@ -101,6 +101,15 @@ object P2pHost {
             val b = android.net.wifi.p2p.WifiP2pConfig.Builder()
                 .setNetworkName(NET_NAME)
                 .setPassphrase(PASSPHRASE)
+                // PERSISTENT, because this is what actually retires the
+                // approval bubble on hardware whose HAL never completes a
+                // credential join (the glasses' does not): a persistent
+                // group is REMEMBERED on both ends after one accepted join,
+                // and every later join is a reinvocation the owner admits
+                // without asking a human. Temporary groups forget the
+                // pairing on teardown, which is why the bubble kept coming
+                // back — every capture restart met a stranger.
+                .enablePersistentMode(true)
             if (freq != null) b.setGroupOperatingFrequency(freq)
             else b.setGroupOperatingBand(android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
             m.createGroup(c, b.build(), object : WifiP2pManager.ActionListener {
