@@ -379,6 +379,12 @@ class CaptureService : Service() {
                         // and it doubles as the manual fallback if it does.
                         13 -> InjectBridge.pip(this, close = true, byPositionOnly = true)
                         14 -> InjectBridge.closeApp(this)
+                        // The glasses' compact mirror wants a landscape
+                        // stream: 15 pins the phone to landscape, 16 hands
+                        // rotation back to the sensor. Rotation-follow then
+                        // reconfigures the encoder on its own.
+                        15 -> forceRotation(true)
+                        16 -> forceRotation(false)
                         else -> Log.w(TAG, "unknown global code $g")
                     }
                 }
@@ -563,6 +569,31 @@ class CaptureService : Service() {
                 }
             startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }.onFailure { Log.w(TAG, "app launch failed: ${it.message}") }
+    }
+
+    /**
+     * Pin the phone to landscape, or give rotation back to the sensor.
+     *
+     * Writes the same two system settings the Quick Settings tile does. That
+     * needs the WRITE_SETTINGS appop, which only the user (or adb) can grant —
+     * so a missing grant is LOGGED at warning rather than failing silently,
+     * because from the glasses "nothing happened" and "not permitted" would
+     * otherwise look identical.
+     */
+    private fun forceRotation(landscape: Boolean) {
+        if (!android.provider.Settings.System.canWrite(this)) {
+            Log.w(TAG, "rotate: WRITE_SETTINGS not granted — " +
+                "run: adb shell appops set $packageName WRITE_SETTINGS allow")
+            return
+        }
+        val cr = contentResolver
+        if (landscape) {
+            android.provider.Settings.System.putInt(cr, "accelerometer_rotation", 0)
+            android.provider.Settings.System.putInt(cr, "user_rotation", 1)
+        } else {
+            android.provider.Settings.System.putInt(cr, "accelerometer_rotation", 1)
+        }
+        Log.i(TAG, "rotate: ${if (landscape) "pinned landscape" else "auto restored"}")
     }
 
     /**
