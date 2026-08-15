@@ -270,18 +270,77 @@ object InjectBridge {
      */
     fun closeApp(ctx: Context): Boolean {
         val s = service ?: run { warn(); return false }
-        val before = s.rootInActiveWindow?.packageName?.toString()
+        // WHICH app, decided BEFORE the switcher opens and the answer is gone.
+        val target = s.rootInActiveWindow?.packageName?.toString()
+        if (target == null) { Log.w(TAG, "closeApp: nothing in front to close"); return false }
+        val label = runCatching {
+            val pm = ctx.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(target, 0)).toString()
+        }.getOrNull()
+        Log.i(TAG, "closeApp: target=$target label=$label")
+
         s.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
         Thread.sleep(RECENTS_MS)
+
+        // FIND THE CARD, DO NOT AIM AT THE MIDDLE. Flicking screen-centre
+        // assumes the switcher put the app you were in under your finger, and
+        // it does not always: the cards are a scrolling row, the layout shifts
+        // with how many are open, and mid-animation the centre belongs to a
+        // neighbour — so a blind swipe throws away somebody else's app.
+        // The card carries the app's name, so match it and use its own bounds.
+        val card = label?.let { findCard(s, it) }
         val dm = ctx.resources.displayMetrics
-        val x = dm.widthPixels / 2f
-        swipe(x, dm.heightPixels * 0.55f, x, dm.heightPixels * 0.08f, CARD_FLICK_MS)
+        if (card != null) {
+            Log.i(TAG, "closeApp: card for '$label' at $card")
+            swipe(card.exactCenterX(), card.exactCenterY().coerceAtLeast(dm.heightPixels * 0.30f),
+                card.exactCenterX(), dm.heightPixels * 0.06f, CARD_FLICK_MS)
+        } else {
+            // No card found by name — say so rather than guessing at the
+            // middle, because a wrong guess closes an app they never mentioned.
+            Log.w(TAG, "closeApp: no card matching '$label'; leaving the switcher alone")
+            s.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+            return false
+        }
         Thread.sleep(900)
         s.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-        Thread.sleep(600)
-        val after = s.rootInActiveWindow?.packageName?.toString()
-        Log.i(TAG, "closeApp: was=$before now=$after")
+        Thread.sleep(700)
+        // Did the RIGHT one go? Ask the system, not the gesture.
+        val gone = runCatching {
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.runningAppProcesses?.none { it.processName == target } ?: true
+        }.getOrDefault(true)
+        Log.i(TAG, "closeApp: $target closed=$gone")
         return true
+    }
+
+    /**
+     * The switcher card whose label matches [label], by its on-screen bounds.
+     *
+     * Matched on the app's own name because that is what the card shows; a
+     * substring match either way covers "Maps" against "Google Maps" and the
+     * card descriptions that append things like ", app card".
+     */
+    private fun findCard(s: AccessibilityService, label: String): android.graphics.Rect? {
+        val wanted = label.lowercase()
+        for (w in s.windows) {
+            val root = w.root ?: continue
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            var seen = 0
+            while (queue.isNotEmpty() && seen < MAX_NODES) {
+                val n = queue.removeFirst(); seen++
+                val text = ((n.contentDescription?.toString() ?: "") + " " +
+                    (n.text?.toString() ?: "")).lowercase().trim()
+                if (text.isNotEmpty() && (text.contains(wanted) || wanted.contains(text))) {
+                    val r = android.graphics.Rect().also { n.getBoundsInScreen(it) }
+                    // A label sits inside the card; anything tiny or offscreen
+                    // is a stray match rather than the card itself.
+                    if (r.width() > 100 && r.height() > 100) return r
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return null
     }
 
     /**
