@@ -10,6 +10,7 @@ import android.hardware.display.DisplayManager
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.view.Display
+import android.view.KeyEvent
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -352,10 +353,33 @@ class CaptureService : Service() {
                     InjectBridge.swipe(fx1 * s.x, fy1 * s.y, fx2 * s.x, fy2 * s.y, ms)
                 }
                 'G' -> {
-                    when (inp.readInt()) {
+                    // 1-3 are navigation, done through accessibility. 4 and up
+                    // are transport, dispatched as real media keys — the OS
+                    // hands them to whichever session owns audio focus, so one
+                    // code works across every player without the agent having
+                    // to find, identify and hit a button by sight.
+                    when (val g = inp.readInt()) {
                         1 -> InjectBridge.global(GLOBAL_ACTION_BACK)
                         2 -> InjectBridge.global(GLOBAL_ACTION_HOME)
                         3 -> InjectBridge.global(GLOBAL_ACTION_RECENTS)
+                        4 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                        5 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_PLAY)
+                        6 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                        7 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_NEXT)
+                        8 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                        9 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_REWIND)
+                        10 -> InjectBridge.media(this, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
+                        // The floating video window, addressed by name.
+                        11 -> InjectBridge.pip(this, close = false)
+                        12 -> InjectBridge.pip(this, close = true)
+                        // 13 skips the by-name search and goes straight to the
+                        // measured position. It exists so the positional path
+                        // is EXERCISED rather than carried as dead code that
+                        // only ever runs the day the named control disappears —
+                        // and it doubles as the manual fallback if it does.
+                        13 -> InjectBridge.pip(this, close = true, byPositionOnly = true)
+                        14 -> InjectBridge.closeApp(this)
+                        else -> Log.w(TAG, "unknown global code $g")
                     }
                 }
                 'U' -> openWebPage(inp.readUTF())
