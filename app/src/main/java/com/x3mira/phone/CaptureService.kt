@@ -382,6 +382,7 @@ class CaptureService : Service() {
                         else -> Log.w(TAG, "unknown global code $g")
                     }
                 }
+                'N' -> { val d = inp.readUTF(); val m = inp.readUTF(); startNavigation(d, m) }
                 'U' -> openWebPage(inp.readUTF())
                 'A' -> openApp(inp.readUTF())
                 'F' -> {
@@ -562,6 +563,59 @@ class CaptureService : Service() {
                 }
             startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }.onFailure { Log.w(TAG, "app launch failed: ${it.message}") }
+    }
+
+    /**
+     * Turn-by-turn navigation, started as an intent rather than by driving the
+     * Maps UI with taps.
+     *
+     * This is the one errand where getting it wrong has a cost outside the
+     * phone: the wearer is about to walk or drive somewhere, possibly at
+     * night, possibly in traffic. Tapping through Maps by sight would mean
+     * finding a search box, typing, choosing among results, selecting a travel
+     * mode and finding Start — five chances to pick the wrong row, and the
+     * wearer would not necessarily notice that the mode was wrong until they
+     * were being sent down a motorway on foot.
+     *
+     * "google.navigation:" removes all of it. Maps resolves the destination
+     * itself, ALWAYS routes from the device's current location, and begins
+     * guidance immediately. The travel mode is part of the URI, so "walk"
+     * cannot silently become "drive": d driving, b bicycling, w walking.
+     *
+     * mode "search" is the other half — geo:0,0?q= asks Maps a question
+     * ("where is the nearest chemist") and shows it on the map WITHOUT
+     * starting to navigate anywhere, which is what a query means.
+     */
+    private fun startNavigation(destination: String, mode: String) {
+        val dest = destination.trim()
+        if (dest.isEmpty()) { Log.w(TAG, "navigate: no destination"); return }
+        val enc = android.net.Uri.encode(dest)
+        val uri = when (mode.trim().lowercase()) {
+            "search", "query", "find" -> android.net.Uri.parse("geo:0,0?q=$enc")
+            else -> {
+                val m = when (mode.trim().lowercase()) {
+                    "bicycle", "bike", "cycling" -> "b"
+                    "walk", "walking", "foot" -> "w"
+                    else -> "d"
+                }
+                android.net.Uri.parse("google.navigation:q=$enc&mode=$m")
+            }
+        }
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            setPackage(MAPS_PKG)
+        }
+        val ok = runCatching { startActivity(intent) }.isSuccess
+        if (!ok) {
+            // Maps missing or refusing the package-scoped intent: let the
+            // system choose a handler rather than failing silently, which
+            // would leave the wearer standing there waiting for a route.
+            Log.w(TAG, "navigate: Maps did not take it; offering to any handler")
+            runCatching {
+                startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.onFailure { Log.w(TAG, "navigate failed: ${it.message}") }
+        }
+        Log.i(TAG, "navigate mode=$mode -> $uri")
     }
 
     private fun openWebPage(raw: String) {
@@ -1255,6 +1309,9 @@ class CaptureService : Service() {
         // this hardware, set false to revert to guaranteed-alive capture-once.
         const val ROTATE_FOLLOW = true
         const val PORT = 7391
+
+        /** Named so the navigation intent goes to Maps rather than a chooser. */
+        const val MAPS_PKG = "com.google.android.apps.maps"
         const val CHAN = "dexprobe"
         const val MAGIC_HELLO = 0xDEC0DE00.toInt()
         const val MAGIC_FRAME = 0xDEC0DE01.toInt()
