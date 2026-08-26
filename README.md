@@ -18,3 +18,16 @@ attached at this end so a pair of glasses never carries a usable key.
 
 The two apps ship together — the wire format is shared and unversioned, so
 update them as a pair.
+
+---
+
+## License
+
+[MIT](LICENSE), with a project notice about what this half in particular can
+do. It holds the **MediaProjection** grant, so it captures every pixel of this
+phone's screen; it holds an **accessibility service**, so it can tap, scroll
+and type as though someone were holding the device; and it performs the
+glasses' **model calls**, so a picture of the screen leaves the phone when an
+errand runs. The stream itself is not encrypted by this software.
+
+Read it before granting either permission.

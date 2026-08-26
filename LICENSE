@@ -1,0 +1,55 @@
+MIT License
+
+Copyright (c) 2026 tropicalstream
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+ADDITIONAL NOTICE FOR THIS PROJECT
+
+This Software is sample and demonstration code, published as a reference for
+building on AR smart glasses. It is not a finished consumer product.
+
+IT MIRRORS EVERYTHING. Screen capture does not distinguish between a map and
+a banking app. Whatever is on the phone — notifications, messages, passwords
+as they are typed, one-time codes, anything shoulder-surfable — is encoded
+and sent to the glasses while mirroring runs. Stop the capture before doing
+anything you would not want on the display.
+
+THE LINK IS NOT ENCRYPTED BY THIS SOFTWARE. The video, audio and control
+stream travel over a plain TCP socket on the local network, or over a Wi-Fi
+Direct group whose network name and passphrase are FIXED CONSTANTS IN THIS
+SOURCE and therefore public. Anyone in radio range running this code can join
+that group. Change both constants before relying on it, and treat the link as
+readable by anyone on the same network.
+
+IT CAN OPERATE THE PHONE. The companion app holds an accessibility service so
+the glasses can tap, scroll and type. Anything reaching that channel can act
+on the phone as though a person were holding it.
+
+THE PAGE AGENT SENDS YOUR SCREEN OFF-DEVICE. When an errand runs, a JPEG of
+the mirrored phone screen is uploaded to a model provider (Google Gemini, or
+Groq for speech) using your own API key, and is handled under that
+provider's terms rather than these. The feature is inert until you supply a
+key, but while it runs the contents of your screen leave your devices.
+
+AWARENESS. This drives a display worn over the eyes. Do not use it while
+driving or operating machinery, and stay alert to your surroundings. Use is
+entirely at your own risk.
