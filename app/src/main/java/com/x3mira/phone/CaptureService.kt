@@ -266,6 +266,10 @@ class CaptureService : Service() {
         // Opt-in: only host a group when the wearer has said there is no
         // router to rely on. Forming one otherwise can take the Wi-Fi radio
         // away from a connection that is working perfectly well.
+        // Follow the phone's default network from here on: the glasses'
+        // model calls are made on this device, so a handover this end is an
+        // outage at theirs until the pool is evicted and requests rebound.
+        PhoneNet.start(this)
         if (HudCfg.p2pHost(this)) P2pHost.start(this, PORT)
         advertise()
         while (running) {

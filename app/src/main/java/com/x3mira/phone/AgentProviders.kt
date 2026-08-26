@@ -7,7 +7,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 /**
  * The LLM side of the page agent, carved out of SmartView's GroqSpeech and
@@ -95,12 +94,15 @@ object AgentProviders {
             .getString("${p.keyName}_api_key", "").orEmpty().trim()
     }
 
-    private val http: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(90, TimeUnit.SECONDS)
-            .build()
-    }
+    /**
+     * The client comes from [PhoneNet], which rebuilds it whenever the phone's
+     * default network changes and evicts the old pool. A client held here as
+     * a lazy val outlived every handover, so its pooled sockets — opened on
+     * an interface the phone had since left — were still handed to new
+     * requests, which then waited out the read timeout for a reply that could
+     * not arrive.
+     */
+    private fun http() = PhoneNet.client()
 
     /**
      * Perform one of page-agent's LLM calls natively. [onResult] gets
@@ -161,7 +163,7 @@ object AgentProviders {
                     )
                 }
 
-                http.newCall(builder.build()).execute().use { resp ->
+                http().newCall(builder.build()).execute().use { resp ->
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
                     if (!resp.isSuccessful) {
                         Log.w(TAG, "HTTP ${resp.code}: ${String(bytes).take(300)}")
@@ -236,7 +238,7 @@ object AgentProviders {
         } else {
             builder.method(method.uppercase(), body.toRequestBody(contentType.toMediaType()))
         }
-        http.newCall(builder.build()).execute().use { resp ->
+        http().newCall(builder.build()).execute().use { resp ->
             Pair(resp.code, resp.body?.bytes() ?: ByteArray(0))
         }
     } catch (t: Throwable) {
